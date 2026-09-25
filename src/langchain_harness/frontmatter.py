@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
 
@@ -16,16 +17,17 @@ def parse_frontmatter(text: str) -> tuple[dict[str, Any], str]:
     body.
     """
     stripped = text.lstrip()
-    if not stripped.startswith("---"):
+    if not stripped.startswith("---\n") and not stripped.startswith("---\r\n"):
         return {}, text
 
-    # Split after the first --- line.
+    # Split after the first --- line, then look for a matching closing line.
     _, rest = stripped.split("---", 1)
-    parts = rest.split("---", 1)
-    if len(parts) != 2:
+    close_match = re.search(r"^---\s*$", rest, flags=re.MULTILINE)
+    if not close_match:
         return {}, text
 
-    yaml_text, body = parts
+    yaml_text = rest[: close_match.start()]
+    body = rest[close_match.end() :]
     try:
         metadata = yaml.safe_load(yaml_text) or {}
     except yaml.YAMLError:

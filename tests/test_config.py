@@ -40,6 +40,7 @@ def test_flags_override_toml(tmp_path: Path, monkeypatch) -> None:
 
 
 def test_api_key_fallback_anthropic(tmp_path: Path, monkeypatch) -> None:
+    _clear_keys(monkeypatch)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "secret")
     monkeypatch.setenv("HARNESS_MODEL", "claude-3")
     config = resolve_config(tmp_path)
@@ -47,6 +48,7 @@ def test_api_key_fallback_anthropic(tmp_path: Path, monkeypatch) -> None:
 
 
 def test_api_key_fallback_openai(tmp_path: Path, monkeypatch) -> None:
+    _clear_keys(monkeypatch)
     monkeypatch.setenv("OPENAI_API_KEY", "open-secret")
     monkeypatch.setenv("HARNESS_PROVIDER", "openai")
     monkeypatch.setenv("HARNESS_MODEL", "gpt-4")
@@ -67,3 +69,22 @@ def test_base_url_resolution(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("HARNESS_BASE_URL", "http://example.com")
     config = resolve_config(tmp_path)
     assert config.base_url == "http://example.com"
+
+
+def test_harness_api_key_beats_provider_fallback(tmp_path: Path, monkeypatch) -> None:
+    _clear_keys(monkeypatch)
+    monkeypatch.setenv("HARNESS_API_KEY", "harness-secret")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "anthropic-secret")
+    monkeypatch.setenv("HARNESS_MODEL", "claude-3")
+    config = resolve_config(tmp_path)
+    assert config.api_key == "harness-secret"
+
+
+def test_malformed_toml_warns_and_returns_empty(tmp_path: Path, monkeypatch, caplog) -> None:
+    _clear_keys(monkeypatch)
+    monkeypatch.setenv("HARNESS_MODEL", "gpt-4")
+    (tmp_path / "harness.toml").write_text("[model\nprovider = 'openai'\n", encoding="utf-8")
+    with caplog.at_level("WARNING"):
+        config = resolve_config(tmp_path)
+    assert config == Config(provider="anthropic", model="gpt-4")
+    assert "Malformed harness.toml" in caplog.text

@@ -26,3 +26,10 @@ def test_parse_file(tmp_path: Path) -> None:
     meta, body = parse_file(path)
     assert meta == {"name": "example", "description": "desc"}
     assert body == "body"
+
+
+def test_embedded_dashes_not_delimiter() -> None:
+    text = "---\nname: example\n---\nsome --- markdown\n--- more"
+    meta, body = parse_frontmatter(text)
+    assert meta == {"name": "example"}
+    assert body == "some --- markdown\n--- more"

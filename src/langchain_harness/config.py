@@ -2,16 +2,16 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-if sys.version_info >= (3, 11):
-    import tomllib
-else:
-    import tomli as tomllib
+import tomllib
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -31,7 +31,8 @@ def _load_toml(path: Path) -> dict[str, Any]:
     try:
         with path.open("rb") as fh:
             data = tomllib.load(fh)
-    except (tomllib.TOMLDecodeError, OSError):
+    except (tomllib.TOMLDecodeError, OSError) as exc:
+        logger.warning("Malformed harness.toml %s: %s; ignoring", path, exc)
         return {}
     return data if isinstance(data, dict) else {}
 

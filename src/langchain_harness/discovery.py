@@ -1,4 +1,4 @@
-"""Discovery of skills, agents, and memory files in a project directory."""
+"""Discovery of skills, agents, memory files, and MCP config in a project directory."""
 
 from __future__ import annotations
 
@@ -23,6 +23,11 @@ def discover_memory(root: Path) -> list[Path]:
     """Return existing AGENTS.md / CLAUDE.md memory files in precedence order."""
     candidates = [root / "CLAUDE.md", root / "AGENTS.md"]
     return [p for p in candidates if p.is_file()]
+
+
+def discover_mcp_config(root: Path) -> Path:
+    """Return the path to the project's ``mcp.json`` file."""
+    return root / "mcp.json"
 
 
 def discover_all(root: Path) -> tuple[Path | None, list[Path], list[Path]]:

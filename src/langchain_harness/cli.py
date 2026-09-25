@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import logging
 from pathlib import Path
-from typing import Optional
 
 import typer
 
@@ -25,11 +24,12 @@ def _setup_logging() -> None:
 
 @app.command()
 def run(
-    prompt: Optional[str] = typer.Argument(None, help="Prompt to run in one-shot mode."),
-    provider: Optional[str] = typer.Option(None, "--provider", help="Model provider (e.g. anthropic, openai)."),
-    model: Optional[str] = typer.Option(None, "--model", help="Model name (e.g. claude-3-5-sonnet-latest)."),
-    base_url: Optional[str] = typer.Option(None, "--base-url", help="Custom base URL for OpenAI-compatible endpoints."),
-    api_key: Optional[str] = typer.Option(None, "--api-key", help="API key for the provider."),
+    prompt_arg: str | None = typer.Argument(None, metavar="PROMPT", help="Prompt to run in one-shot mode."),
+    prompt: str | None = typer.Option(None, "-p", "--prompt", help="Prompt to run in one-shot mode."),
+    provider: str | None = typer.Option(None, "--provider", help="Model provider (e.g. anthropic, openai)."),
+    model: str | None = typer.Option(None, "--model", help="Model name (e.g. claude-3-5-sonnet-latest)."),
+    base_url: str | None = typer.Option(None, "--base-url", help="Custom base URL for OpenAI-compatible endpoints."),
+    api_key: str | None = typer.Option(None, "--api-key", help="API key for the provider."),
 ) -> None:
     """Run a prompt or start an interactive REPL."""
     _setup_logging()
@@ -45,8 +45,9 @@ def run(
 
     async def _run() -> None:
         agent = await build_agent(config, cwd)
-        if prompt is not None:
-            await run_once(agent, prompt)
+        user_prompt = prompt or prompt_arg
+        if user_prompt is not None:
+            await run_once(agent, user_prompt)
         else:
             await repl(agent)
 

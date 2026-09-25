@@ -6,6 +6,8 @@ from typing import Any
 
 from langchain_core.messages import HumanMessage
 from rich.console import Console
+from rich.markup import escape
+from rich.text import Text
 
 REPL_THREAD_ID = "harness-repl"
 ONCE_THREAD_ID = "harness-run"
@@ -17,10 +19,13 @@ def _render_tool_call(console: Console, event: dict[str, Any]) -> None:
     data = event.get("data", {})
     input_data = data.get("input") if isinstance(data, dict) else None
     if isinstance(input_data, dict):
-        brief = ", ".join(f"{k}={v!r}" for k, v in list(input_data.items())[:3])
+        brief = ", ".join(
+            f"{escape(str(k))}={escape(str(v))}" for k, v in list(input_data.items())[:3]
+        )
     else:
         brief = "..."
-    console.print(f"\n[dim]→ running tool [bold]{name}[/bold]({brief})[/dim]")
+    safe_name = escape(str(name))
+    console.print(f"\n[dim]→ running tool [bold]{safe_name}[/bold]({brief})[/dim]")
 
 
 async def _stream_turn(
@@ -34,7 +39,7 @@ async def _stream_turn(
     messages = {"messages": [HumanMessage(content=prompt)]}
 
     async for event in agent.astream_events(
-        {"root": messages},
+        messages,
         config,
         version="v2",
     ):
@@ -43,7 +48,12 @@ async def _stream_turn(
             chunk = event.get("data", {}).get("chunk")
             content = getattr(chunk, "content", "")
             if content:
-                console.print(content, end="")
+                if isinstance(content, list):
+                    for block in content:
+                        if isinstance(block, dict) and block.get("type") == "text":
+                            console.print(Text(block.get("text", "")), end="")
+                else:
+                    console.print(Text(content), end="")
         elif kind == "on_tool_start":
             _render_tool_call(console, event)
 
@@ -74,4 +84,7 @@ async def repl(agent: Any) -> None:
             console.print("Goodbye.")
             break
 
-        await _stream_turn(agent, prompt, REPL_THREAD_ID, console)
+        try:
+            await _stream_turn(agent, prompt, REPL_THREAD_ID, console)
+        except Exception as exc:  # noqa: BLE001
+            console.print(f"[red]Error:[/red] {exc}")

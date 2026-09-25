@@ -111,3 +111,55 @@ def test_invalid_server_skipped(tmp_path: Path, caplog) -> None:
     assert connections == {
         "good": {"transport": "stdio", "command": "cat", "args": []}
     }
+
+
+def test_non_dict_top_level_warns(tmp_path: Path, caplog) -> None:
+    path = tmp_path / "mcp.json"
+    path.write_text(json.dumps(["not", "a", "dict"]), encoding="utf-8")
+    with caplog.at_level("WARNING"):
+        assert load_mcp_connections(path) == {}
+    assert "top level is not an object" in caplog.text
+
+
+def test_non_dict_mcp_servers_warns(tmp_path: Path, caplog) -> None:
+    path = tmp_path / "mcp.json"
+    path.write_text(json.dumps({"mcpServers": []}), encoding="utf-8")
+    with caplog.at_level("WARNING"):
+        assert load_mcp_connections(path) == {}
+    assert "mcpServers is not an object" in caplog.text
+
+
+def test_missing_url_skipped(tmp_path: Path, caplog) -> None:
+    path = tmp_path / "mcp.json"
+    path.write_text(
+        json.dumps({"mcpServers": {"bad": {"type": "http"}}}),
+        encoding="utf-8",
+    )
+    with caplog.at_level("WARNING"):
+        assert load_mcp_connections(path) == {}
+    assert "missing url" in caplog.text
+
+
+def test_unsupported_transport_skipped(tmp_path: Path, caplog) -> None:
+    path = tmp_path / "mcp.json"
+    path.write_text(
+        json.dumps(
+            {"mcpServers": {"bad": {"type": "ftp", "url": "ftp://example.com"}}}
+        ),
+        encoding="utf-8",
+    )
+    with caplog.at_level("WARNING"):
+        assert load_mcp_connections(path) == {}
+    assert "unsupported transport" in caplog.text
+
+
+def test_flat_dict_fallback(tmp_path: Path) -> None:
+    path = tmp_path / "mcp.json"
+    path.write_text(
+        json.dumps({"stdio-server": {"command": "cat", "args": []}}),
+        encoding="utf-8",
+    )
+    connections = load_mcp_connections(path)
+    assert connections == {
+        "stdio-server": {"transport": "stdio", "command": "cat", "args": []}
+    }

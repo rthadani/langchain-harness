@@ -47,7 +47,7 @@ All discovery is relative to the **current working directory**:
 
 - **Skills:** `.claude/skills/<name>/SKILL.md` → passed to `create_deep_agent(skills=[...])`.
 - **Subagents:** `.claude/agents/*.md` → parsed as `SubAgent` definitions. Frontmatter must contain `name` and `description`; `model` is optional. Any `tools:` frontmatter list is ignored in this version.
-- **Memory:** `CLAUDE.md` and `AGENTS.md` → concatenated into the system prompt.
+- **Memory:** `CLAUDE.md` and `AGENTS.md` → passed as `memory=[...]` paths to `create_deep_agent`.
 - **MCP:** `mcp.json` in Claude Code format. Example:
 
 ```json
