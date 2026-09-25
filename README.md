@@ -117,6 +117,80 @@ Sessions are persisted in `<cwd>/.harness/sessions.db`. Each REPL or one-shot ru
 - `/resume <id-or-prefix>` — switch to a different session mid-REPL.
 - `/compact` — ask the model to call the `compact_conversation` tool immediately. The tool's response is shown verbatim; if the conversation is below the configured trigger threshold the tool refuses and the refusal is displayed.
 
+## Server mode (multi-user web API)
+
+The harness can run as a multi-user web API server with per-user workspace isolation and token-based auth.
+
+### Quick start
+
+```bash
+# add two users (tokens are printed once)
+uv run harness users add alice
+uv run harness users add bob
+
+# list users
+uv run harness users list
+
+# revoke a user
+uv run harness users revoke alice
+
+# start the server
+HARNESS_PROVIDER=anthropic HARNESS_MODEL=claude-3-5-sonnet-latest HARNESS_API_KEY=... uv run harness serve
+```
+
+### API surface
+
+All endpoints require `Authorization: Bearer harn_...`:
+
+- `POST /v1/sessions` — create a new session.
+- `GET /v1/sessions` — list the authenticated user's sessions only.
+- `GET /v1/sessions/{id}/history` — message history for a session.
+- `POST /v1/sessions/{id}/messages` — send a message, stream the response via SSE.
+- `POST /v1/sessions/{id}/compact` — stream the compact flow via SSE.
+- `DELETE /v1/sessions/{id}` — delete a session.
+
+Sessions in another user's database return `404` naturally — there is no ownership-filtering logic to get wrong.
+
+### Privacy model
+
+Each user gets `<server-cwd>/.harness/users/<user_id>/` containing:
+
+- `workspace/` — the agent's filesystem backend root (a `FilesystemBackend` with no shell tool).
+- `sessions.db` — their own checkpoints + sessions table.
+- `conversation_history/` — lands inside the workspace automatically.
+
+**Shell is off by default** in server mode. The agent uses a plain `FilesystemBackend` that enforces per-user path isolation — the agent cannot access files outside its workspace root.
+
+**Warning: `enable_shell = true` voids per-user privacy.** When shell is enabled, the agent gets a `LocalShellBackend` that can `cd` to any path. This is a deliberate escape hatch for trusted single-user deployments, not a recommended configuration.
+
+**MCP tools are outside the privacy boundary.** MCP servers configured in `mcp.json` are loaded once at startup and shared across all users. They run as host-side processes with whatever access the server process has. Only configure MCP servers that all authenticated users are allowed to use.
+
+### Copy-on-build shared config
+
+Skills (`.claude/skills`) and memory files (`CLAUDE.md`, `AGENTS.md`) are read through the agent's per-user backend, so they must be inside the workspace to be visible. On first agent build (and on rebuild), the harness copies shared config from the server's CWD into the user's workspace:
+
+- `.claude/skills` → `<user-workspace>/.claude/skills`
+- `CLAUDE.md` / `AGENTS.md` → `<user-workspace>/`
+
+Agent definition files (`.claude/agents/*.md`) and `mcp.json` are parsed host-side, so they stay shared without copying.
+
+### Server configuration
+
+Add a `[server]` section to `harness.toml`:
+
+```toml
+[server]
+host = "127.0.0.1"
+port = 8000
+enable_shell = false
+```
+
+Env overrides: `HARNESS_SERVER_HOST`, `HARNESS_SERVER_PORT`, `HARNESS_SERVER_ENABLE_SHELL`.
+
+### Auth
+
+Tokens are `harn_` + 32 bytes of URL-safe randomness, stored as SHA-256 hashes in a global `server.db` (separate from any user's session database). The plaintext token is shown only once at creation time.
+
 ## Important risks and limitations
 
 - **Auto-run:** The harness runs all tools and shell commands without asking for approval. This is intentional for headless use, but dangerous. Run it only in directories you are willing to modify.
@@ -126,7 +200,7 @@ Sessions are persisted in `<cwd>/.harness/sessions.db`. Each REPL or one-shot ru
 - **Compaction is model-mediated:** `/compact` sends a normal turn and relies on the model to call the `compact_conversation` tool. If the conversation is below the configured trigger threshold the tool refuses and only the refusal text is shown; no summarization happens.
 - **Session storage grows unboundedly:** `.harness/sessions.db` accumulates one row per conversation. Prune old rows manually or with a separate job for now.
 - **Conversation offloads:** deepagents may write large conversation summaries to `<cwd>/conversation_history/<session>.md` and `<cwd>/large_tool_results/`. These directories appear in the current working directory.
-- **Per-call MCP:** MCP stdio servers are started fresh for each tool invocation. Stateful MCP servers may lose state between calls.
+- **Server-mode MCP is shared:** MCP servers configured in `mcp.json` are loaded once and shared across all users. They are outside the per-user privacy boundary.
 
 ## Development
 

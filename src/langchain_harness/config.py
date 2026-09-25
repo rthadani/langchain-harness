@@ -28,6 +28,15 @@ class CompactionConfig:
 
 
 @dataclass(frozen=True)
+class ServerConfig:
+    """Configuration for the multi-user web API server."""
+
+    host: str = "127.0.0.1"
+    port: int = 8000
+    enable_shell: bool = False
+
+
+@dataclass(frozen=True)
 class Config:
     """Resolved harness model configuration."""
 
@@ -36,6 +45,7 @@ class Config:
     base_url: str | None = None
     api_key: str | None = None
     compaction: CompactionConfig = field(default_factory=CompactionConfig)
+    server: ServerConfig = field(default_factory=ServerConfig)
 
 
 def _load_toml(path: Path) -> dict[str, Any]:
@@ -108,6 +118,29 @@ def _api_key_fallback(provider: str) -> str | None:
     return None
 
 
+def _resolve_server(toml_data: dict[str, Any]) -> ServerConfig:
+    """Build a ``ServerConfig`` from [server] TOML and env vars."""
+    toml_section = toml_data.get("server", {})
+    if not isinstance(toml_section, dict):
+        toml_section = {}
+
+    host = os.environ.get("HARNESS_SERVER_HOST") or toml_section.get("host") or "127.0.0.1"
+
+    port_env = os.environ.get("HARNESS_SERVER_PORT")
+    port_val = int(port_env) if port_env and port_env.isdigit() else None
+    port = port_val if port_val and port_val > 0 else int(toml_section.get("port", 8000))
+
+    shell_env = os.environ.get("HARNESS_SERVER_ENABLE_SHELL", "").lower()
+    if shell_env in {"1", "true", "yes"}:
+        enable_shell = True
+    elif shell_env in {"0", "false", "no"}:
+        enable_shell = False
+    else:
+        enable_shell = bool(toml_section.get("enable_shell", False))
+
+    return ServerConfig(host=host, port=port, enable_shell=enable_shell)
+
+
 def resolve_config(
     cwd: Path,
     *,
@@ -158,6 +191,7 @@ def resolve_config(
         raise SystemExit(1)
 
     compaction = _resolve_compaction(toml)
+    server = _resolve_server(toml)
 
     return Config(
         provider=resolved_provider,
@@ -165,4 +199,5 @@ def resolve_config(
         base_url=resolved_base_url,
         api_key=resolved_api_key,
         compaction=compaction,
+        server=server,
     )

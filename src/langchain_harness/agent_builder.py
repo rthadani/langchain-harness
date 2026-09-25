@@ -7,7 +7,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from deepagents.backends import LocalShellBackend
+from deepagents.backends import FilesystemBackend, LocalShellBackend
 from deepagents.graph import create_deep_agent
 from deepagents.middleware.subagents import SubAgent
 from deepagents.middleware.summarization import (
@@ -19,7 +19,7 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.tools import BaseTool
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_harness.config import CompactionConfig, Config
-from langchain_harness.discovery import discover_all, discover_mcp_config
+from langchain_harness.discovery import discover_all, discover_agents, discover_mcp_config
 from langchain_harness.frontmatter import parse_file
 from langchain_harness.mcp_loader import load_mcp_connections
 
@@ -162,54 +162,128 @@ def _build_summarization_middleware(
     return [summarization, tool_middleware]
 
 
+def _build_backend(
+    cwd: Path,
+    *,
+    enable_shell: bool = False,
+    root_dir: str | Path | None = None,
+) -> Any:
+    """Build the agent backend.
+
+    In CLI mode (``enable_shell=True``), uses ``LocalShellBackend`` with full
+    shell access — same as before.  In server mode (``enable_shell=False``),
+    uses a plain ``FilesystemBackend`` so per-user file privacy is enforced.
+    """
+    backend_root = str(root_dir) if root_dir is not None else str(cwd)
+    if enable_shell:
+        return LocalShellBackend(
+            root_dir=backend_root, virtual_mode=False, inherit_env=True
+        )
+    return FilesystemBackend(root_dir=backend_root)
+
+
 async def build_agent(
     config: Config,
     cwd: Path,
     checkpointer: Any,
+    *,
+    enable_shell: bool = True,
+    root_dir: str | Path | None = None,
+    skills_override: list[str] | None = None,
+    memory_override: list[str] | None = None,
+    model: Any | None = None,
+    tools_override: list[BaseTool] | None = None,
+    backend: Any | None = None,
 ) -> Any:
-    """Build a harness agent for *cwd*."""
-    model = _build_model(config)
+    """Build a harness agent for *cwd*.
 
-    skills_dir, agent_paths, memory_paths = discover_all(cwd)
+    Parameters
+    ----------
+    config:
+        Resolved harness configuration.
+    cwd:
+        Current working directory (used for discovery).
+    checkpointer:
+        LangGraph checkpointer for the agent.
+    enable_shell:
+        If True (default, CLI mode), use ``LocalShellBackend`` with shell.
+        If False (server mode), use ``FilesystemBackend`` without shell.
+    root_dir:
+        Override the backend's root directory (for per-user workspaces).
+    skills_override:
+        Explicit skills directory paths (skip discovery, use workspace copies).
+    memory_override:
+        Explicit memory file paths (skip discovery, use workspace copies).
+    model:
+        Pre-built model (skip model construction, used by server for shared model).
+    tools_override:
+        Pre-loaded MCP tools (skip MCP loading, used by server for shared tools).
+    backend:
+        Pre-built backend (skip backend construction).
+    """
+    if model is not None:
+        _model = model
+    else:
+        _model = _build_model(config)
 
-    skills = [str(skills_dir)] if skills_dir is not None else None
+    if skills_override is not None:
+        skills = skills_override if skills_override else None
+    else:
+        skills_dir, _, _ = discover_all(cwd)
+        skills = [str(skills_dir)] if skills_dir is not None else None
+
+    if memory_override is not None:
+        memory_paths = [Path(p) for p in memory_override if Path(p).is_file()]
+    else:
+        _, _, memory_paths = discover_all(cwd)
+
+    _, agent_paths, _ = (
+        discover_all(cwd) if skills_override is None and memory_override is None else (None, discover_agents(cwd), [])
+    )
     subagents, subagent_sources = _load_subagents(agent_paths, config.provider)
 
-    connections = load_mcp_connections(discover_mcp_config(cwd))
+    if tools_override is not None:
+        mcp_tools = tools_override
+    else:
+        connections = load_mcp_connections(discover_mcp_config(cwd))
 
-    async def _load_one_mcp(name: str, connection: dict[str, Any]) -> list[BaseTool]:
-        try:
-            client = MultiServerMCPClient(
-                {name: connection}, tool_name_prefix=True
-            )
-            return await asyncio.wait_for(
-                client.get_tools(), timeout=_MCP_TOOLS_TIMEOUT
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "Could not load MCP server %r: %s; continuing without it", name, exc
-            )
-            return []
+        async def _load_one_mcp(name: str, connection: dict[str, Any]) -> list[BaseTool]:
+            try:
+                client = MultiServerMCPClient(
+                    {name: connection}, tool_name_prefix=True
+                )
+                return await asyncio.wait_for(
+                    client.get_tools(), timeout=_MCP_TOOLS_TIMEOUT
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Could not load MCP server %r: %s; continuing without it", name, exc
+                )
+                return []
 
-    mcp_tools: list[BaseTool] = []
-    if connections:
-        loaded = await asyncio.gather(
-            *(_load_one_mcp(name, conn) for name, conn in connections.items())
-        )
-        for tools in loaded:
-            mcp_tools.extend(tools)
+        mcp_tools: list[BaseTool] = []
+        if connections:
+            loaded = await asyncio.gather(
+                *(_load_one_mcp(name, conn) for name, conn in connections.items())
+            )
+            for tools in loaded:
+                mcp_tools.extend(tools)
 
-    backend = LocalShellBackend(root_dir=str(cwd), virtual_mode=False, inherit_env=True)
-    middleware = _build_summarization_middleware(model, backend, config.compaction)
+    if backend is not None:
+        agent_backend = backend
+    else:
+        agent_backend = _build_backend(cwd, enable_shell=enable_shell, root_dir=root_dir)
+
+    middleware = _build_summarization_middleware(_model, agent_backend, config.compaction)
 
     agent_kwargs: dict[str, Any] = {
-        "model": model,
+        "model": _model,
         "tools": mcp_tools or None,
         "system_prompt": "You are a helpful coding assistant. Work in the user's project directory.",
         "subagents": subagents or None,
         "skills": skills,
         "memory": [str(p) for p in memory_paths] or None,
-        "backend": backend,
+        "backend": agent_backend,
         "checkpointer": checkpointer,
     }
     if middleware is not None:

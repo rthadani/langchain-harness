@@ -6,24 +6,16 @@ import asyncio
 from typing import Any, Callable
 
 import aiosqlite
-from langchain_core.messages import HumanMessage
 from rich.console import Console
 from rich.markup import escape
 from rich.text import Text
 
 from langchain_harness import sessions
-
-_COMPACT_PROMPT = (
-    "Please call the compact_conversation tool immediately to summarize this "
-    "conversation."
-)
+from langchain_harness.events import COMPACT_PROMPT, stream_turn_events
 
 
-def _render_tool_call(console: Console, event: dict[str, Any]) -> None:
+def _render_tool_call(console: Console, name: str, input_data: Any) -> None:
     """Print a concise note that a tool is being invoked."""
-    name = event.get("name", "unknown")
-    data = event.get("data", {})
-    input_data = data.get("input") if isinstance(data, dict) else None
     if isinstance(input_data, dict):
         brief = ", ".join(
             f"{escape(str(k))}={escape(str(v))}"
@@ -35,18 +27,6 @@ def _render_tool_call(console: Console, event: dict[str, Any]) -> None:
     console.print(f"\n[dim]→ running tool [bold]{safe_name}[/bold]({brief})[/dim]")
 
 
-def _tool_output_text(event: dict[str, Any]) -> str | None:
-    """Extract a string representation of a tool's output, if present."""
-    data = event.get("data", {})
-    output = data.get("output") if isinstance(data, dict) else None
-    if output is None:
-        return None
-    content = getattr(output, "content", output)
-    if isinstance(content, list):
-        return "\n".join(str(block) for block in content)
-    return str(content)
-
-
 async def _stream_turn(
     agent: Any,
     prompt: str,
@@ -56,29 +36,16 @@ async def _stream_turn(
     tool_end_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> None:
     """Stream a single turn from *agent* to the console."""
-    config = {"configurable": {"thread_id": thread_id}}
-    messages = {"messages": [HumanMessage(content=prompt)]}
-
-    async for event in agent.astream_events(
-        messages,
-        config,
-        version="v2",
-    ):
-        kind = event.get("event")
-        if kind == "on_chat_model_stream":
-            chunk = event.get("data", {}).get("chunk")
-            content = getattr(chunk, "content", "")
-            if content:
-                if isinstance(content, list):
-                    for block in content:
-                        if isinstance(block, dict) and block.get("type") == "text":
-                            console.print(Text(block.get("text", "")), end="")
-                else:
-                    console.print(Text(content), end="")
-        elif kind == "on_tool_start":
-            _render_tool_call(console, event)
-        elif kind == "on_tool_end" and tool_end_callback is not None:
+    async for event in stream_turn_events(agent, prompt, thread_id):
+        etype = event["type"]
+        if etype == "token":
+            console.print(Text(event["text"]), end="")
+        elif etype == "tool_start":
+            _render_tool_call(console, event["name"], event.get("input"))
+        elif etype == "tool_end" and tool_end_callback is not None:
             tool_end_callback(event)
+        elif etype == "done":
+            pass
 
     console.print()
 
@@ -104,10 +71,14 @@ async def run_once(
     if console is None:
         console = Console()
     try:
-        await _stream_turn(agent, prompt, thread_id, console)
-    except (KeyboardInterrupt, asyncio.CancelledError):
-        console.print("\n[dim]Turn interrupted.[/dim]")
-    await _upsert_session(db_conn, thread_id, title=prompt)
+        try:
+            await _stream_turn(agent, prompt, thread_id, console)
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            console.print("\n[dim]Turn interrupted.[/dim]")
+        except Exception as exc:  # noqa: BLE001
+            console.print(f"[red]Error:[/red] {escape(str(exc))}")
+    finally:
+        await _upsert_session(db_conn, thread_id, title=prompt)
 
 
 async def _list_sessions_command(
@@ -158,14 +129,14 @@ async def _compact_command(
 
     def _on_tool_end(event: dict[str, Any]) -> None:
         if event.get("name") == "compact_conversation":
-            text = _tool_output_text(event)
+            text = event.get("output")
             if text is not None:
                 compact_outputs.append(text)
 
     try:
         await _stream_turn(
             agent,
-            _COMPACT_PROMPT,
+            COMPACT_PROMPT,
             thread_id,
             console,
             tool_end_callback=_on_tool_end,

@@ -215,7 +215,7 @@ def test_render_tool_call_non_dict_input() -> None:
     printed: list[Any] = []
     console.print = lambda *args, **kwargs: printed.append((args, kwargs))  # type: ignore[method-assign]
 
-    _render_tool_call(console, {"name": "tool", "data": {"input": "not-a-dict"}})
+    _render_tool_call(console, "tool", "not-a-dict")
 
     assert any("..." in str(p[0]) for p in printed)
 
@@ -227,7 +227,8 @@ def test_render_tool_call_truncates_more_than_three_keys() -> None:
 
     _render_tool_call(
         console,
-        {"name": "tool", "data": {"input": {"a": 1, "b": 2, "c": 3, "d": 4}}},
+        "tool",
+        {"a": 1, "b": 2, "c": 3, "d": 4},
     )
 
     output = str(printed[0][0])
@@ -243,7 +244,8 @@ def test_render_tool_call_escapes_markup_in_args() -> None:
 
     _render_tool_call(
         console,
-        {"name": "tool", "data": {"input": {"[key]": "[value]"}}},
+        "tool",
+        {"[key]": "[value]"},
     )
 
     captured = output.getvalue()

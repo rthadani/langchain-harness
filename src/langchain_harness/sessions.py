@@ -119,10 +119,10 @@ async def resolve_prefix(conn: aiosqlite.Connection, prefix: str) -> str:
         """
         SELECT thread_id
         FROM sessions
-        WHERE thread_id LIKE ?
+        WHERE thread_id GLOB ?
         ORDER BY updated_at DESC
         """,
-        (f"{prefix}%",),
+        (f"{prefix}*",),
     )
     rows = await cursor.fetchall()
     if not rows:
