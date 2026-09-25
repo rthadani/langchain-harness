@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "example-stdio": {
+      "command": "python",
+      "args": ["scripts/echo_server.py"]
+    }
+  }
+}

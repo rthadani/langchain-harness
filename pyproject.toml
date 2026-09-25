@@ -1,0 +1,35 @@
+[project]
+name = "langchain-harness"
+version = "0.1.0"
+description = "A Claude Code-style harness built on LangChain deepagents."
+requires-python = ">=3.11"
+dependencies = [
+    "deepagents==0.7.19",
+    "langchain-mcp-adapters==0.3.2",
+    "langchain-openai",
+    "langchain-anthropic",
+    "langchain>=0.3.0",
+    "typer>=0.12.0",
+    "rich>=13.0.0",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+]
+
+[project.scripts]
+harness = "langchain_harness.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/langchain_harness"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
