@@ -33,10 +33,12 @@ class _FakeAgent:
         self,
         events: list[dict[str, Any]] | None = None,
         state_messages: list[Any] | None = None,
+        checkpointer: Any | None = None,
     ) -> None:
         self._events = events or []
         self._state_messages = state_messages or []
         self.stream_calls: list[tuple[Any, Any]] = []
+        self.checkpointer = checkpointer
 
     async def astream_events(self, input_data: Any, config: Any, *, version: str):
         self.stream_calls.append((input_data, config))
@@ -58,6 +60,16 @@ class _FakeAgentCache:
 
     async def close_all(self) -> None:
         pass
+
+
+class _FakeCheckpointer:
+    """Records adelete_thread calls for checkpoint deletion tests."""
+
+    def __init__(self) -> None:
+        self.deleted_threads: list[str] = []
+
+    async def adelete_thread(self, thread_id: str) -> None:
+        self.deleted_threads.append(thread_id)
 
 
 @pytest.fixture
@@ -262,6 +274,60 @@ async def test_delete_session(test_env) -> None:
 
 
 @pytest.mark.asyncio
+async def test_delete_session_calls_checkpointer_adelete_thread(tmp_path, monkeypatch) -> None:
+    """When the agent exposes a checkpointer, delete_session awaits
+    adelete_thread with the correct thread_id and still deletes the row."""
+    monkeypatch.chdir(tmp_path)
+
+    import aiosqlite
+    from langchain_harness.api.app import create_app
+    from langchain_harness.serverdb import add_user, init_server_db, server_db_path
+
+    db_path = server_db_path(tmp_path)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+
+    async with aiosqlite.connect(str(db_path)) as conn:
+        await init_server_db(conn)
+        token = await add_user(conn, "alice")
+
+    checkpointer = _FakeCheckpointer()
+    fake_agent = _FakeAgent(checkpointer=checkpointer)
+    fake_cache = _FakeAgentCache(fake_agent)
+
+    config = Config(provider="anthropic", model="test-model")
+    app = create_app(tmp_path, config)
+
+    async with app.router.lifespan_context(app):
+        app.state.get_agent = fake_cache.get_agent
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            # Create a session
+            resp = await client.post(
+                "/v1/sessions",
+                json={"title": "checkpoint test"},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            assert resp.status_code == 200
+            session_id = resp.json()["session_id"]
+
+            # Delete it
+            resp = await client.delete(
+                f"/v1/sessions/{session_id}",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            assert resp.status_code == 200
+
+            # Checkpointer was awaited with the right thread_id
+            assert checkpointer.deleted_threads == [session_id]
+
+            # Session row was also deleted
+            resp = await client.get(
+                "/v1/sessions",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            assert resp.json() == []
+
+
 async def test_delete_foreign_session_404(test_env) -> None:
     resp = await test_env["client"].post(
         "/v1/sessions",

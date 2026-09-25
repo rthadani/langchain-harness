@@ -298,3 +298,144 @@ def test_build_summarization_middleware_returns_none_when_no_trigger() -> None:
     backend = object()
     compaction = CompactionConfig()
     assert _build_summarization_middleware(model, backend, compaction) is None
+
+
+# --- build_agent override path ---
+
+
+@pytest.mark.asyncio
+async def test_build_agent_override_skips_model_backend_tools_discovery(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """When all overrides are provided, _build_model, _build_backend, MCP
+    loading, and discover_all are all skipped."""
+    captured: dict[str, Any] = {}
+
+    def fake_create_deep_agent(**kwargs: Any) -> object:
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(
+        "langchain_harness.agent_builder.create_deep_agent", fake_create_deep_agent
+    )
+
+    # init_chat_model must NOT be called when model is overridden
+    def fail_init_chat_model(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("init_chat_model should not be called when model is overridden")
+
+    monkeypatch.setattr(
+        "langchain_harness.agent_builder.init_chat_model", fail_init_chat_model
+    )
+
+    # MultiServerMCPClient must NOT be called when tools_override is set
+    class _ExplodingMCPClient:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            raise AssertionError("MCP client should not be created when tools_override is set")
+
+    monkeypatch.setattr(
+        "langchain_harness.agent_builder.MultiServerMCPClient", _ExplodingMCPClient
+    )
+
+    # discover_all must NOT be called when skills_override / memory_override are set
+    discover_calls: list[Any] = []
+
+    def fake_discover_all(cwd: Path) -> Any:
+        discover_calls.append(cwd)
+        return (None, [], [])
+
+    monkeypatch.setattr(
+        "langchain_harness.agent_builder.discover_all", fake_discover_all
+    )
+
+    fake_model = object()
+    fake_backend = object()
+
+    config = Config(provider="anthropic", model="claude-3")
+    await build_agent(
+        config,
+        tmp_path,
+        checkpointer=object(),
+        model=fake_model,
+        tools_override=[],
+        backend=fake_backend,
+        skills_override=[],
+        memory_override=[],
+    )
+
+    assert captured["model"] is fake_model
+    assert captured["backend"] is fake_backend
+    # tools_override=[] -> mcp_tools=[] -> `mcp_tools or None` -> None
+    assert captured["tools"] is None
+    # skills_override=[] (falsy) -> skills = None
+    assert captured["skills"] is None
+    assert discover_calls == []
+
+
+@pytest.mark.asyncio
+async def test_build_agent_truthy_skills_override_passed_through(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A truthy skills_override list is passed through as the skills source."""
+    captured: dict[str, Any] = {}
+
+    def fake_create_deep_agent(**kwargs: Any) -> object:
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(
+        "langchain_harness.agent_builder.create_deep_agent", fake_create_deep_agent
+    )
+
+    config = Config(provider="anthropic", model="claude-3")
+    await build_agent(
+        config,
+        tmp_path,
+        checkpointer=object(),
+        skills_override=["/some/path"],
+        memory_override=[],
+    )
+
+    assert captured["skills"] == ["/some/path"]
+
+
+@pytest.mark.asyncio
+async def test_build_agent_model_override_used_while_defaults_load(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """When only model is overridden, the override is used while other defaults
+    still load (discovery, MCP, backend)."""
+    captured: dict[str, Any] = {}
+
+    def fake_create_deep_agent(**kwargs: Any) -> object:
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(
+        "langchain_harness.agent_builder.create_deep_agent", fake_create_deep_agent
+    )
+
+    # init_chat_model must NOT be called when model is overridden
+    def fail_init_chat_model(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("init_chat_model should not be called when model is overridden")
+
+    monkeypatch.setattr(
+        "langchain_harness.agent_builder.init_chat_model", fail_init_chat_model
+    )
+
+    fake_model = object()
+
+    config = Config(provider="anthropic", model="claude-3")
+    await build_agent(
+        config,
+        tmp_path,
+        checkpointer=object(),
+        model=fake_model,
+    )
+
+    assert captured["model"] is fake_model
+    # Defaults still loaded: no skills dir in tmp_path -> skills=None
+    assert captured["skills"] is None
+    # No mcp.json -> mcp_tools=[] -> tools=None
+    assert captured["tools"] is None
+    # backend was built via _build_backend (not None)
+    assert captured["backend"] is not None
