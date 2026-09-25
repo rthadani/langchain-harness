@@ -86,5 +86,7 @@ async def repl(agent: Any) -> None:
 
         try:
             await _stream_turn(agent, prompt, REPL_THREAD_ID, console)
+        except KeyboardInterrupt:
+            console.print("\n[dim]Turn interrupted.[/dim]")
         except Exception as exc:  # noqa: BLE001
-            console.print(f"[red]Error:[/red] {exc}")
+            console.print(f"[red]Error:[/red] {escape(str(exc))}")

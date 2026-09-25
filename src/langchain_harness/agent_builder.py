@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from pathlib import Path
 from typing import Any
@@ -41,27 +42,45 @@ def _build_model(config: Config) -> BaseChatModel:
     return init_chat_model(config.model, **kwargs)
 
 
-def _resolve_subagent_model(value: str, path: Path) -> str | None:
+def _resolve_subagent_model(value: str, provider: str, path: Path) -> str | None:
     """Translate a model value from frontmatter into a provider-prefixed spec.
 
     Returns ``None`` when the key should be dropped (e.g. ``inherit``).
-    Logs a warning and returns ``None`` for unrecognised values so the agent
-    is still created without a model override.
+    Bare model IDs are prefixed with the configured provider. Values that are
+    still unusable (empty or missing a provider/model part) log a warning and
+    return ``None`` so the agent is created without a model override.
     """
-    normalized = str(value).strip().lower()
+    stripped = value.strip()
+    normalized = stripped.lower()
     if normalized == "inherit":
         return None
     if normalized in _MODEL_ALIASES:
         return _MODEL_ALIASES[normalized]
-    if ":" in str(value):
-        return str(value)
-    logger.warning(
-        "Unrecognised model %r in %s; keeping agent without model override", value, path
-    )
-    return None
+    if ":" in stripped:
+        provider_part, model_part = stripped.split(":", 1)
+        if not provider_part.strip() or not model_part.strip():
+            logger.warning(
+                "Unrecognised model %r in %s; keeping agent without model override",
+                value,
+                path,
+            )
+            return None
+        return stripped
+    if not stripped:
+        logger.warning(
+            "Unrecognised model %r in %s; keeping agent without model override",
+            value,
+            path,
+        )
+        return None
+    prefixed = f"{provider}:{stripped}"
+    logger.info("Prefixed bare model %r with provider: %s", value, prefixed)
+    return prefixed
 
 
-def _load_subagents(agent_paths: list[Path]) -> tuple[list[SubAgent], dict[str, Path]]:
+def _load_subagents(
+    agent_paths: list[Path], provider: str
+) -> tuple[list[SubAgent], dict[str, Path]]:
     """Parse agent markdown files into ``SubAgent`` definitions.
 
     Returns the subagents plus a mapping from subagent name to source file path
@@ -92,7 +111,7 @@ def _load_subagents(agent_paths: list[Path]) -> tuple[list[SubAgent], dict[str, 
             "system_prompt": body,
         }
         if "model" in metadata:
-            resolved = _resolve_subagent_model(str(metadata["model"]), path)
+            resolved = _resolve_subagent_model(str(metadata["model"]), provider, path)
             if resolved is not None:
                 subagent["model"] = resolved
 
@@ -112,21 +131,29 @@ async def build_agent(
     skills_dir, agent_paths, memory_paths = discover_all(cwd)
 
     skills = [str(skills_dir)] if skills_dir is not None else None
-    subagents, subagent_sources = _load_subagents(agent_paths)
+    subagents, subagent_sources = _load_subagents(agent_paths, config.provider)
 
     connections = load_mcp_connections(discover_mcp_config(cwd))
 
+    async def _load_one_mcp(name: str, connection: dict[str, Any]) -> list[BaseTool]:
+        try:
+            client = MultiServerMCPClient(
+                {name: connection}, tool_name_prefix=True
+            )
+            return await asyncio.wait_for(client.get_tools(), timeout=30)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Could not load MCP server %r: %s; continuing without it", name, exc
+            )
+            return []
+
     mcp_tools: list[BaseTool] = []
     if connections:
-        for name, connection in connections.items():
-            try:
-                client = MultiServerMCPClient({name: connection}, tool_name_prefix=True)
-                tools = await client.get_tools()
-                mcp_tools.extend(tools)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "Could not load MCP server %r: %s; continuing without it", name, exc
-                )
+        loaded = await asyncio.gather(
+            *(_load_one_mcp(name, conn) for name, conn in connections.items())
+        )
+        for tools in loaded:
+            mcp_tools.extend(tools)
 
     backend = LocalShellBackend(root_dir=str(cwd), virtual_mode=False, inherit_env=True)
     checkpointer = InMemorySaver()

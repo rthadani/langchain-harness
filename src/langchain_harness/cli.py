@@ -45,7 +45,7 @@ def run(
 
     async def _run() -> None:
         agent = await build_agent(config, cwd)
-        user_prompt = prompt or prompt_arg
+        user_prompt = prompt_arg if prompt is None else prompt
         if user_prompt is not None:
             await run_once(agent, user_prompt)
         else:

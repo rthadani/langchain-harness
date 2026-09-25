@@ -46,7 +46,7 @@ base_url = "https://api.example.com/v1"
 All discovery is relative to the **current working directory**:
 
 - **Skills:** `.claude/skills/<name>/SKILL.md` → passed to `create_deep_agent(skills=[...])`.
-- **Subagents:** `.claude/agents/*.md` → parsed as `SubAgent` definitions. Frontmatter must contain `name` and `description`; `model` is optional. Any `tools:` frontmatter list is ignored in this version.
+- **Subagents:** `.claude/agents/*.md` → parsed as `SubAgent` definitions. Frontmatter must contain `name` and `description`; `model` is optional. The `model` value can be a provider-prefixed ID (`provider:model`), one of the aliases `sonnet`, `opus`, or `haiku`, or `inherit` to use the parent agent's model. Any `tools:` frontmatter list is ignored in this version.
 - **Memory:** `CLAUDE.md` and `AGENTS.md` → passed as `memory=[...]` paths to `create_deep_agent`.
 - **MCP:** `mcp.json` in Claude Code format. Example:
 
