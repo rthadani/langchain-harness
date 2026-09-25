@@ -109,6 +109,24 @@ async def get_latest(conn: aiosqlite.Connection) -> dict[str, Any] | None:
     return rows[0] if rows else None
 
 
+async def get_session(conn: aiosqlite.Connection, thread_id: str) -> dict[str, Any] | None:
+    """Return a single session by thread_id, or ``None`` if not found."""
+    cursor = await conn.execute(
+        "SELECT thread_id, created_at, updated_at, title "
+        "FROM sessions WHERE thread_id = ?",
+        (thread_id,),
+    )
+    row = await cursor.fetchone()
+    if row is None:
+        return None
+    return {
+        "thread_id": row[0],
+        "created_at": row[1],
+        "updated_at": row[2],
+        "title": row[3],
+    }
+
+
 async def resolve_prefix(conn: aiosqlite.Connection, prefix: str) -> str:
     """Resolve a thread id prefix to a full thread id.
 

@@ -6,8 +6,7 @@ import logging
 from typing import Any
 from uuid import uuid4
 
-import aiosqlite
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
 from langchain_harness.api.auth import get_current_user
@@ -28,7 +27,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/v1/sessions", tags=["sessions"])
 
 
-async def _user_db_path(request: Request, user_id: str):
+def _user_db_path(request: Request, user_id: str):
     from langchain_harness.workspaces import user_sessions_db
     return user_sessions_db(request.app.state.cwd, user_id)
 
@@ -43,7 +42,7 @@ async def create_session(
     """Create a new session for the authenticated user."""
     user_id = user["user_id"]
     thread_id = uuid4().hex
-    db_path = await _user_db_path(request, user_id)
+    db_path = _user_db_path(request, user_id)
     db_path.parent.mkdir(parents=True, exist_ok=True)
     async with connect(db_path) as conn:
         await upsert(conn, thread_id, title=body.title)
@@ -66,7 +65,7 @@ async def list_sessions(
 ) -> list[SessionListItem]:
     """List the authenticated user's sessions only."""
     user_id = user["user_id"]
-    db_path = await _user_db_path(request, user_id)
+    db_path = _user_db_path(request, user_id)
     if not db_path.exists():
         return []
     async with connect(db_path) as conn:
@@ -87,17 +86,14 @@ async def _resolve_session(
 ) -> str:
     """Return the thread_id if the session exists in the user's db, else 404."""
     user_id = user["user_id"]
-    db_path = await _user_db_path(request, user_id)
+    db_path = _user_db_path(request, user_id)
     if not db_path.exists():
         raise HTTPException(status_code=404, detail="Session not found")
     async with connect(db_path) as conn:
-        cursor = await conn.execute(
-            "SELECT thread_id FROM sessions WHERE thread_id = ?", (session_id,)
-        )
-        row = await cursor.fetchone()
-    if row is None:
+        session = await sessions_module.get_session(conn, session_id)
+    if session is None:
         raise HTTPException(status_code=404, detail="Session not found")
-    return row[0]
+    return session["thread_id"]
 
 
 @router.get("/{session_id}/history")
@@ -114,7 +110,8 @@ async def get_history(
     config = {"configurable": {"thread_id": thread_id}}
     try:
         state = await agent.aget_state(config)
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to retrieve state for session %s: %s", thread_id, exc)
         return []
 
     messages = state.values.get("messages", []) if state and state.values else []
@@ -145,7 +142,7 @@ async def send_message(
     thread_id = await _resolve_session(request, user, session_id)
     agent = await request.app.state.get_agent(user["user_id"])
 
-    db_path = await _user_db_path(request, user["user_id"])
+    db_path = _user_db_path(request, user["user_id"])
 
     async def _stream():
         try:
@@ -171,7 +168,7 @@ async def compact_session(
     """Stream the /compact flow as SSE. 404 on foreign session."""
     thread_id = await _resolve_session(request, user, session_id)
     agent = await request.app.state.get_agent(user["user_id"])
-    db_path = await _user_db_path(request, user["user_id"])
+    db_path = _user_db_path(request, user["user_id"])
 
     async def _stream():
         try:
@@ -198,14 +195,13 @@ async def delete_session(
     thread_id = await _resolve_session(request, user, session_id)
     agent = await request.app.state.get_agent(user["user_id"])
 
-    # Try adelete_thread if available, else just remove the session row
-    if hasattr(agent, "adelete_thread"):
-        try:
-            await agent.adelete_thread(thread_id)
-        except Exception:  # noqa: BLE001
-            pass
+    # Delete checkpoint data via the saver, then the sessions metadata row
+    try:
+        await agent.checkpointer.adelete_thread(thread_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to delete checkpoint data for session %s: %s", thread_id, exc)
 
-    db_path = await _user_db_path(request, user["user_id"])
+    db_path = _user_db_path(request, user["user_id"])
     async with connect(db_path) as conn:
         await conn.execute("DELETE FROM sessions WHERE thread_id = ?", (thread_id,))
         await conn.commit()

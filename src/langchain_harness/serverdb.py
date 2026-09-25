@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import secrets
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -72,8 +73,6 @@ async def add_user(conn: aiosqlite.Connection, username: str) -> str:
     )
     if await cursor.fetchone() is not None:
         raise ValueError(f"User {username!r} already exists")
-
-    import uuid
 
     user_id = uuid.uuid4().hex
     token = generate_token()

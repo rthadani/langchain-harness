@@ -44,7 +44,7 @@ def test_hash_and_verify_token() -> None:
     assert verify_token("wrong", h) is False
 
 
-def test_verify_token_constant_time() -> None:
+def test_verify_token_rejects_wrong_token() -> None:
     token = generate_token()
     h = hash_token(token)
     assert verify_token(token, h) is True

@@ -4,13 +4,12 @@ from __future__ import annotations
 
 import asyncio
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
 
 from langchain_harness.api.app import create_app
-from langchain_harness.config import Config, ServerConfig
+from langchain_harness.config import Config
 from langchain_harness.serverdb import add_user, hash_token, init_server_db, server_db_path
 
 
@@ -19,11 +18,24 @@ class _FakeState:
         self.values = {"messages": messages or []} if messages else {}
 
 
+class _FakeMsg:
+    """Fake LangChain message with .type and .content for history tests."""
+
+    def __init__(self, msg_type: str, content: str) -> None:
+        self.type = msg_type
+        self.content = content
+
+
 class _FakeAgent:
     """Fake agent for testing SSE streaming and history."""
 
-    def __init__(self, events: list[dict[str, Any]] | None = None) -> None:
+    def __init__(
+        self,
+        events: list[dict[str, Any]] | None = None,
+        state_messages: list[Any] | None = None,
+    ) -> None:
         self._events = events or []
+        self._state_messages = state_messages or []
         self.stream_calls: list[tuple[Any, Any]] = []
 
     async def astream_events(self, input_data: Any, config: Any, *, version: str):
@@ -32,7 +44,7 @@ class _FakeAgent:
             yield event
 
     async def aget_state(self, config: Any) -> _FakeState:
-        return _FakeState()
+        return _FakeState(messages=self._state_messages)
 
 
 class _FakeAgentCache:
@@ -46,29 +58,6 @@ class _FakeAgentCache:
 
     async def close_all(self) -> None:
         pass
-
-
-async def _setup_app(tmp_path, agent: Any | None = None, config: Config | None = None) -> httpx.AsyncClient:
-    """Create a test app with a fake agent cache."""
-    if config is None:
-        config = Config(provider="anthropic", model="test-model")
-
-    app = create_app(tmp_path, config)
-
-    # Replace the lifespan-based cache with a fake
-    fake_agent = agent or _FakeAgent()
-    fake_cache = _FakeAgentCache(fake_agent)
-
-    # We need to run the lifespan to set up server.db, then swap the cache
-    async with app.router.lifespan_context(app):
-        app.state.get_agent = fake_cache.get_agent
-
-        transport = httpx.ASGITransport(app=app)
-        client = httpx.AsyncClient(transport=transport, base_url="http://test")
-        # We can't return from inside the lifespan context, so we need a different approach
-        yield client
-
-    # This won't work cleanly... let me use a different approach
 
 
 @pytest.fixture
@@ -370,8 +359,68 @@ async def test_history_empty_session(test_env) -> None:
         headers={"Authorization": f"Bearer {test_env['token_a']}"},
     )
     assert resp.status_code == 200
-    # Empty or list
-    assert isinstance(resp.json(), list)
+    assert resp.json() == []
+
+
+@pytest.mark.asyncio
+async def test_history_returns_messages_after_send(tmp_path, monkeypatch) -> None:
+    """Send a message, then fetch history — real message shapes must be present."""
+    monkeypatch.chdir(tmp_path)
+
+    import aiosqlite
+
+    db_path = server_db_path(tmp_path)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+
+    async with aiosqlite.connect(str(db_path)) as conn:
+        await init_server_db(conn)
+        token = await add_user(conn, "alice")
+
+    config = Config(provider="anthropic", model="test-model")
+    app = create_app(tmp_path, config)
+
+    fake_agent = _FakeAgent(
+        events=[
+            {"event": "on_chat_model_stream", "data": {"chunk": _Chunk("Hello")}},
+        ],
+        state_messages=[
+            _FakeMsg("human", "hello"),
+            _FakeMsg("ai", "Hello"),
+        ],
+    )
+    fake_cache = _FakeAgentCache(fake_agent)
+
+    async with app.router.lifespan_context(app):
+        app.state.get_agent = fake_cache.get_agent
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post(
+                "/v1/sessions",
+                json={"title": "history test"},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            session_id = resp.json()["session_id"]
+
+            # Send a message (streams the fake response)
+            resp = await client.post(
+                f"/v1/sessions/{session_id}/messages",
+                json={"content": "hello"},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            assert resp.status_code == 200
+
+            # Fetch history — should contain real message shapes
+            resp = await client.get(
+                f"/v1/sessions/{session_id}/history",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            assert resp.status_code == 200
+            messages = resp.json()
+            assert len(messages) == 2
+            assert messages[0]["role"] == "human"
+            assert messages[0]["content"] == "hello"
+            assert messages[1]["role"] == "ai"
+            assert messages[1]["content"] == "Hello"
 
 
 # --- smoke isolation ---

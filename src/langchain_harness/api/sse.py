@@ -28,7 +28,6 @@ async def stream_sse_response(
     streaming task is cancelled.
     """
     queue: asyncio.Queue[str | None] = asyncio.Queue()
-    cancelled = asyncio.Event()
 
     async def _produce() -> None:
         try:
@@ -49,7 +48,6 @@ async def stream_sse_response(
                 elif etype == "done":
                     await queue.put(_sse_event("done", {}))
         except asyncio.CancelledError:
-            cancelled.set()
             raise
         except Exception as exc:  # noqa: BLE001
             await queue.put(_sse_event("error", {"detail": str(exc)}))

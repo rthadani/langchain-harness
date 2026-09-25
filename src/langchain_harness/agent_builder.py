@@ -226,20 +226,26 @@ async def build_agent(
     else:
         _model = _build_model(config)
 
+    # When any discovery override is set, we still need agent_paths from the
+    # host cwd (subagents are parsed host-side, not from the workspace).
+    # When no overrides are set, discover everything in a single pass.
+    if skills_override is not None or memory_override is not None:
+        skills_dir, agent_paths, memory_paths_discovered = (
+            None, discover_agents(cwd), []
+        )
+    else:
+        skills_dir, agent_paths, memory_paths_discovered = discover_all(cwd)
+
     if skills_override is not None:
         skills = skills_override if skills_override else None
     else:
-        skills_dir, _, _ = discover_all(cwd)
         skills = [str(skills_dir)] if skills_dir is not None else None
 
     if memory_override is not None:
         memory_paths = [Path(p) for p in memory_override if Path(p).is_file()]
     else:
-        _, _, memory_paths = discover_all(cwd)
+        memory_paths = memory_paths_discovered
 
-    _, agent_paths, _ = (
-        discover_all(cwd) if skills_override is None and memory_override is None else (None, discover_agents(cwd), [])
-    )
     subagents, subagent_sources = _load_subagents(agent_paths, config.provider)
 
     if tools_override is not None:

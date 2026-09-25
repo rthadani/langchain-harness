@@ -11,9 +11,8 @@ from typing import Any
 import aiosqlite
 from fastapi import FastAPI
 
-from langchain_harness.agent_builder import _build_backend, _build_model, _load_subagents
+from langchain_harness.agent_builder import _build_backend, _build_model, build_agent
 from langchain_harness.config import Config
-from langchain_harness.discovery import discover_agents
 from langchain_harness.mcp_loader import load_mcp_connections
 from langchain_harness.api.routes_sessions import router as sessions_router
 from langchain_harness.serverdb import init_server_db, server_db_path
@@ -56,6 +55,10 @@ class UserAgentCache:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Could not load MCP server %r: %s", name, exc)
         self.shared_mcp_tools = mcp_tools
+        # MultiServerMCPClient is stateless: get_tools() creates a temporary
+        # session per call (subprocess spawned and torn down inside the context
+        # manager), so there are no persistent stdio processes to close on
+        # shutdown.
 
     async def get_agent(self, user_id: str) -> Any:
         """Get or build the agent for a user. Thread-safe via per-user lock."""
@@ -74,11 +77,6 @@ class UserAgentCache:
     async def _build_user_agent(self, user_id: str) -> Any:
         """Build a deep agent for a specific user with their own workspace/saver."""
         from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
-        from deepagents.graph import create_deep_agent
-        from deepagents.middleware.summarization import (
-            SummarizationMiddleware,
-            SummarizationToolMiddleware,
-        )
 
         workspace = provision_user_workspace(self.cwd, user_id)
         db_path = user_sessions_db(self.cwd, user_id)
@@ -89,7 +87,6 @@ class UserAgentCache:
         saver = await saver_ctx.__aenter__()
         self._saver_contexts[user_id] = saver_ctx
 
-        # Build backend
         enable_shell = self.config.server.enable_shell
         if enable_shell:
             logger.warning(
@@ -103,58 +100,29 @@ class UserAgentCache:
             root_dir=workspace,
         )
 
-        # Skills/memory from workspace
+        # Skills/memory from the provisioned workspace (synced copies)
         skills_dir = get_workspace_skills_dir(workspace)
-        skills = [str(skills_dir)] if skills_dir is not None else None
+        skills_override = [str(skills_dir)] if skills_dir is not None else []
         memory_paths = get_workspace_memory_paths(workspace)
-        memory = [str(p) for p in memory_paths] or None
-
-        # Subagents from host-side discovery (parsed host-side, not through backend)
-        agent_paths = discover_agents(self.cwd)
-        subagents, subagent_sources = _load_subagents(agent_paths, self.config.provider)
-
-        # Middleware
-        middleware = None
-        if self.config.compaction.trigger_tokens is not None or self.config.compaction.trigger_messages is not None:
-            if self.config.compaction.trigger_tokens is not None:
-                trigger = ("tokens", self.config.compaction.trigger_tokens)
-            else:
-                trigger = ("messages", self.config.compaction.trigger_messages)
-            keep = ("messages", self.config.compaction.keep_messages)
-            summarization = SummarizationMiddleware(
-                model=self.shared_model,
-                backend=backend,
-                trigger=trigger,
-                keep=keep,
-            )
-            tool_middleware = SummarizationToolMiddleware(
-                summarization,
-                system_prompt="Use the compact_conversation tool when the user asks to compact the conversation.",
-            )
-            middleware = [summarization, tool_middleware]
-
-        agent_kwargs: dict[str, Any] = {
-            "model": self.shared_model,
-            "tools": self.shared_mcp_tools or None,
-            "system_prompt": "You are a helpful coding assistant. Work in the user's project directory.",
-            "subagents": subagents or None,
-            "skills": skills,
-            "memory": memory,
-            "backend": backend,
-            "checkpointer": saver,
-        }
-        if middleware is not None:
-            agent_kwargs["middleware"] = middleware
+        memory_override = [str(p) for p in memory_paths]
 
         try:
-            return create_deep_agent(**agent_kwargs)
+            return await build_agent(
+                self.config,
+                self.cwd,
+                checkpointer=saver,
+                enable_shell=enable_shell,
+                root_dir=workspace,
+                skills_override=skills_override,
+                memory_override=memory_override,
+                model=self.shared_model,
+                tools_override=self.shared_mcp_tools,
+                backend=backend,
+            )
         except Exception as exc:  # noqa: BLE001
-            # Clean up saver on failure
             await saver_ctx.__aexit__(type(exc), exc, exc.__traceback__)
             del self._saver_contexts[user_id]
-            raise RuntimeError(
-                f"Failed to build agent for user {user_id}; check subagent files: {subagent_sources!r}"
-            ) from exc
+            raise
 
     async def close_all(self) -> None:
         """Close all savers on shutdown."""
