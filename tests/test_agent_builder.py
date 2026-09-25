@@ -4,12 +4,14 @@ from typing import Any
 import pytest
 
 from langchain_harness.agent_builder import (
+    _MCP_TOOLS_TIMEOUT,
     _build_model,
+    _build_summarization_middleware,
     _load_subagents,
     _resolve_subagent_model,
     build_agent,
 )
-from langchain_harness.config import Config
+from langchain_harness.config import CompactionConfig, Config
 
 
 def test_load_subagents_skips_missing_name_or_description(tmp_path: Path, caplog) -> None:
@@ -148,6 +150,151 @@ async def test_build_agent_passes_inherit_env_to_shell_backend(tmp_path: Path, m
     monkeypatch.setattr("langchain_harness.agent_builder.create_deep_agent", fake_create_deep_agent)
 
     config = Config(provider="anthropic", model="claude-3")
-    await build_agent(config, tmp_path)
+    await build_agent(config, tmp_path, checkpointer=object())
 
     assert captured.get("inherit_env") is True
+
+
+def test_mcp_tools_timeout_is_module_constant() -> None:
+    assert isinstance(_MCP_TOOLS_TIMEOUT, int)
+    assert _MCP_TOOLS_TIMEOUT == 30
+
+
+@pytest.mark.asyncio
+async def test_build_agent_gracefully_degrades_when_one_mcp_server_fails(
+    tmp_path: Path,
+    monkeypatch,
+    caplog,
+) -> None:
+    """If one MCP server raises, the healthy server's tools still load."""
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    class _FailingClient:
+        def __init__(self, servers: dict[str, Any], *, tool_name_prefix: bool = False) -> None:
+            calls.append(("client", servers))
+
+        async def get_tools(self) -> list[Any]:
+            raise RuntimeError("server is down")
+
+    class _HealthyClient:
+        def __init__(self, servers: dict[str, Any], *, tool_name_prefix: bool = False) -> None:
+            calls.append(("client", servers))
+
+        async def get_tools(self) -> list[Any]:
+            return [object()]
+
+    def fake_client(servers: dict[str, Any], *, tool_name_prefix: bool = False) -> Any:
+        name = next(iter(servers))
+        if name == "bad":
+            return _FailingClient(servers, tool_name_prefix=tool_name_prefix)
+        return _HealthyClient(servers, tool_name_prefix=tool_name_prefix)
+
+    def fake_create_deep_agent(**kwargs: Any) -> object:
+        return kwargs
+
+    monkeypatch.setattr(
+        "langchain_harness.agent_builder.MultiServerMCPClient", fake_client
+    )
+    monkeypatch.setattr(
+        "langchain_harness.agent_builder.create_deep_agent", fake_create_deep_agent
+    )
+    monkeypatch.setattr(
+        "langchain_harness.agent_builder.load_mcp_connections",
+        lambda _path: {"bad": {"command": "echo"}, "good": {"command": "echo"}},
+    )
+
+    config = Config(provider="anthropic", model="claude-3")
+    with caplog.at_level("WARNING"):
+        result = await build_agent(config, tmp_path, checkpointer=object())
+
+    assert "Could not load MCP server" in caplog.text
+    tools = result.get("tools") or []
+    assert len(tools) == 1
+
+
+@pytest.mark.asyncio
+async def test_build_agent_passes_middleware_when_compaction_configured(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_create_deep_agent(**kwargs: Any) -> object:
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(
+        "langchain_harness.agent_builder.create_deep_agent", fake_create_deep_agent
+    )
+
+    config = Config(
+        provider="anthropic",
+        model="claude-3",
+        compaction=CompactionConfig(trigger_tokens=1000, keep_messages=10),
+    )
+    await build_agent(config, tmp_path, checkpointer=object())
+
+    assert "middleware" in captured
+    middleware = captured["middleware"]
+    assert len(middleware) == 2
+    assert middleware[0].__class__.__name__ == "_DeepAgentsSummarizationMiddleware"
+    assert middleware[1].__class__.__name__ == "SummarizationToolMiddleware"
+    inner = middleware[0]._lc_helper
+    assert inner.trigger == ("tokens", 1000)
+    assert inner.keep == ("messages", 10)
+
+
+@pytest.mark.asyncio
+async def test_build_agent_omits_middleware_when_compaction_not_configured(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_create_deep_agent(**kwargs: Any) -> object:
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(
+        "langchain_harness.agent_builder.create_deep_agent", fake_create_deep_agent
+    )
+
+    config = Config(provider="anthropic", model="claude-3")
+    await build_agent(config, tmp_path, checkpointer=object())
+
+    assert "middleware" not in captured
+
+
+@pytest.mark.asyncio
+async def test_build_agent_uses_message_trigger_when_configured(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_create_deep_agent(**kwargs: Any) -> object:
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(
+        "langchain_harness.agent_builder.create_deep_agent", fake_create_deep_agent
+    )
+
+    config = Config(
+        provider="anthropic",
+        model="claude-3",
+        compaction=CompactionConfig(trigger_messages=50, keep_messages=5),
+    )
+    await build_agent(config, tmp_path, checkpointer=object())
+
+    middleware = captured["middleware"]
+    inner = middleware[0]._lc_helper
+    assert inner.trigger == ("messages", 50)
+    assert inner.keep == ("messages", 5)
+
+
+def test_build_summarization_middleware_returns_none_when_no_trigger() -> None:
+    model = object()
+    backend = object()
+    compaction = CompactionConfig()
+    assert _build_summarization_middleware(model, backend, compaction) is None

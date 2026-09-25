@@ -10,18 +10,28 @@ from typing import Any
 from deepagents.backends import LocalShellBackend
 from deepagents.graph import create_deep_agent
 from deepagents.middleware.subagents import SubAgent
+from deepagents.middleware.summarization import (
+    SummarizationMiddleware,
+    SummarizationToolMiddleware,
+)
 from langchain.chat_models import init_chat_model
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.tools import BaseTool
 from langchain_mcp_adapters.client import MultiServerMCPClient
-from langgraph.checkpoint.memory import InMemorySaver
-
-from langchain_harness.config import Config
+from langchain_harness.config import CompactionConfig, Config
 from langchain_harness.discovery import discover_all, discover_mcp_config
 from langchain_harness.frontmatter import parse_file
 from langchain_harness.mcp_loader import load_mcp_connections
 
 logger = logging.getLogger(__name__)
+
+# Seconds to wait for a single MCP server to return its tool list.
+_MCP_TOOLS_TIMEOUT = 30
+
+# Nudge appended to the tool middleware so the model knows when to call it.
+_COMPACT_TOOL_NUDGE = (
+    "Use the compact_conversation tool when the user asks to compact the conversation."
+)
 
 # Known Claude-style model aliases for subagent frontmatter.  Values are passed
 # verbatim to ``init_chat_model`` as ``provider:model`` strings.
@@ -121,9 +131,41 @@ def _load_subagents(
     return subagents, source_map
 
 
+def _build_summarization_middleware(
+    model: BaseChatModel,
+    backend: Any,
+    compaction: CompactionConfig,
+) -> list[Any] | None:
+    """Build compaction middleware when a threshold is configured.
+
+    Returns ``None`` when the user has not set a trigger so that deepagents'
+    own defaults remain untouched.
+    """
+    if compaction.trigger_tokens is not None:
+        trigger: tuple[str, int] = ("tokens", compaction.trigger_tokens)
+    elif compaction.trigger_messages is not None:
+        trigger = ("messages", compaction.trigger_messages)
+    else:
+        return None
+
+    keep = ("messages", compaction.keep_messages)
+    summarization = SummarizationMiddleware(
+        model=model,
+        backend=backend,
+        trigger=trigger,
+        keep=keep,
+    )
+    tool_middleware = SummarizationToolMiddleware(
+        summarization,
+        system_prompt=_COMPACT_TOOL_NUDGE,
+    )
+    return [summarization, tool_middleware]
+
+
 async def build_agent(
     config: Config,
     cwd: Path,
+    checkpointer: Any,
 ) -> Any:
     """Build a harness agent for *cwd*."""
     model = _build_model(config)
@@ -140,7 +182,9 @@ async def build_agent(
             client = MultiServerMCPClient(
                 {name: connection}, tool_name_prefix=True
             )
-            return await asyncio.wait_for(client.get_tools(), timeout=30)
+            return await asyncio.wait_for(
+                client.get_tools(), timeout=_MCP_TOOLS_TIMEOUT
+            )
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "Could not load MCP server %r: %s; continuing without it", name, exc
@@ -156,19 +200,23 @@ async def build_agent(
             mcp_tools.extend(tools)
 
     backend = LocalShellBackend(root_dir=str(cwd), virtual_mode=False, inherit_env=True)
-    checkpointer = InMemorySaver()
+    middleware = _build_summarization_middleware(model, backend, config.compaction)
+
+    agent_kwargs: dict[str, Any] = {
+        "model": model,
+        "tools": mcp_tools or None,
+        "system_prompt": "You are a helpful coding assistant. Work in the user's project directory.",
+        "subagents": subagents or None,
+        "skills": skills,
+        "memory": [str(p) for p in memory_paths] or None,
+        "backend": backend,
+        "checkpointer": checkpointer,
+    }
+    if middleware is not None:
+        agent_kwargs["middleware"] = middleware
 
     try:
-        return create_deep_agent(
-            model=model,
-            tools=mcp_tools or None,
-            system_prompt="You are a helpful coding assistant. Work in the user's project directory.",
-            subagents=subagents or None,
-            skills=skills,
-            memory=[str(p) for p in memory_paths] or None,
-            backend=backend,
-            checkpointer=checkpointer,
-        )
+        return create_deep_agent(**agent_kwargs)
     except Exception as exc:  # noqa: BLE001
         raise RuntimeError(
             f"Failed to build agent; check subagent files: {subagent_sources!r}"

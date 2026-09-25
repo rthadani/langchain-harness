@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from langchain_harness.config import Config, resolve_config
+from langchain_harness.config import CompactionConfig, Config, resolve_config
 
 
 def _clear_keys(monkeypatch) -> None:
@@ -88,3 +88,60 @@ def test_malformed_toml_warns_and_returns_empty(tmp_path: Path, monkeypatch, cap
         config = resolve_config(tmp_path)
     assert config == Config(provider="anthropic", model="gpt-4")
     assert "Malformed harness.toml" in caplog.text
+
+
+def test_compaction_defaults_to_unconfigured(tmp_path: Path, monkeypatch) -> None:
+    _clear_keys(monkeypatch)
+    monkeypatch.setenv("HARNESS_MODEL", "gpt-4")
+    config = resolve_config(tmp_path)
+    assert config.compaction == CompactionConfig()
+
+
+def test_compaction_parsed_from_toml(tmp_path: Path, monkeypatch) -> None:
+    _clear_keys(monkeypatch)
+    monkeypatch.setenv("HARNESS_MODEL", "gpt-4")
+    (tmp_path / "harness.toml").write_text(
+        "[compaction]\ntrigger_tokens = 1000\nkeep_messages = 10\n",
+        encoding="utf-8",
+    )
+    config = resolve_config(tmp_path)
+    assert config.compaction.trigger_tokens == 1000
+    assert config.compaction.trigger_messages is None
+    assert config.compaction.keep_messages == 10
+
+
+def test_compaction_env_overrides_toml(tmp_path: Path, monkeypatch) -> None:
+    _clear_keys(monkeypatch)
+    monkeypatch.setenv("HARNESS_MODEL", "gpt-4")
+    monkeypatch.setenv("HARNESS_COMPACTION_TRIGGER_TOKENS", "500")
+    monkeypatch.setenv("HARNESS_COMPACTION_KEEP_MESSAGES", "5")
+    (tmp_path / "harness.toml").write_text(
+        "[compaction]\ntrigger_tokens = 1000\nkeep_messages = 10\n",
+        encoding="utf-8",
+    )
+    config = resolve_config(tmp_path)
+    assert config.compaction.trigger_tokens == 500
+    assert config.compaction.keep_messages == 5
+
+
+def test_compaction_mutual_exclusion_errors(tmp_path: Path, monkeypatch) -> None:
+    _clear_keys(monkeypatch)
+    monkeypatch.setenv("HARNESS_MODEL", "gpt-4")
+    (tmp_path / "harness.toml").write_text(
+        "[compaction]\ntrigger_tokens = 1000\ntrigger_messages = 50\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(SystemExit):
+        resolve_config(tmp_path)
+
+
+def test_compaction_invalid_values_ignored(tmp_path: Path, monkeypatch) -> None:
+    _clear_keys(monkeypatch)
+    monkeypatch.setenv("HARNESS_MODEL", "gpt-4")
+    (tmp_path / "harness.toml").write_text(
+        "[compaction]\ntrigger_tokens = 'lots'\nkeep_messages = -1\n",
+        encoding="utf-8",
+    )
+    config = resolve_config(tmp_path)
+    assert config.compaction.trigger_tokens is None
+    assert config.compaction.keep_messages == 20

@@ -5,13 +5,26 @@ from __future__ import annotations
 import logging
 import os
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import tomllib
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class CompactionConfig:
+    """User-configurable conversation compaction thresholds.
+
+    Either ``trigger_tokens`` or ``trigger_messages`` may be set, but not both.
+    When neither is set the harness leaves compaction to deepagents defaults.
+    """
+
+    trigger_tokens: int | None = None
+    trigger_messages: int | None = None
+    keep_messages: int = 20
 
 
 @dataclass(frozen=True)
@@ -22,6 +35,7 @@ class Config:
     model: str
     base_url: str | None = None
     api_key: str | None = None
+    compaction: CompactionConfig = field(default_factory=CompactionConfig)
 
 
 def _load_toml(path: Path) -> dict[str, Any]:
@@ -35,6 +49,54 @@ def _load_toml(path: Path) -> dict[str, Any]:
         logger.warning("Malformed harness.toml %s: %s; ignoring", path, exc)
         return {}
     return data if isinstance(data, dict) else {}
+
+
+def _parse_int(value: Any) -> int | None:
+    """Parse a config value as a positive integer, returning ``None`` on failure."""
+    if value is None:
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _resolve_compaction(toml_data: dict[str, Any]) -> CompactionConfig:
+    """Build a ``CompactionConfig`` from [compaction] TOML and env vars.
+
+    Raises ``SystemExit`` if both trigger types are configured.
+    """
+    toml_section = toml_data.get("compaction", {})
+    if not isinstance(toml_section, dict):
+        toml_section = {}
+
+    trigger_tokens = (
+        _parse_int(os.environ.get("HARNESS_COMPACTION_TRIGGER_TOKENS"))
+        or _parse_int(toml_section.get("trigger_tokens"))
+    )
+    trigger_messages = (
+        _parse_int(os.environ.get("HARNESS_COMPACTION_TRIGGER_MESSAGES"))
+        or _parse_int(toml_section.get("trigger_messages"))
+    )
+    keep_messages = (
+        _parse_int(os.environ.get("HARNESS_COMPACTION_KEEP_MESSAGES"))
+        or _parse_int(toml_section.get("keep_messages"))
+        or 20
+    )
+
+    if trigger_tokens is not None and trigger_messages is not None:
+        print(
+            "Error: [compaction] trigger_tokens and trigger_messages are mutually exclusive.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
+    return CompactionConfig(
+        trigger_tokens=trigger_tokens,
+        trigger_messages=trigger_messages,
+        keep_messages=keep_messages,
+    )
 
 
 def _api_key_fallback(provider: str) -> str | None:
@@ -95,9 +157,12 @@ def resolve_config(
         )
         raise SystemExit(1)
 
+    compaction = _resolve_compaction(toml)
+
     return Config(
         provider=resolved_provider,
         model=resolved_model,
         base_url=resolved_base_url,
         api_key=resolved_api_key,
+        compaction=compaction,
     )
