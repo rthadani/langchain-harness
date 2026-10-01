@@ -18,7 +18,10 @@ from langchain_harness.runner import repl, run_once
 from langchain_harness import sessions
 from langchain_harness.sessions import connect, get_latest, resolve_prefix
 
-app = typer.Typer(help="LangChain deepagents harness (Claude Code style).")
+app = typer.Typer(
+    help="LangChain deepagents harness (Claude Code style).",
+    context_settings={"help_option_names": ["--help", "-h"]},
+)
 users_app = typer.Typer(help="Manage API users for server mode.")
 app.add_typer(users_app, name="users")
 
@@ -30,10 +33,24 @@ def _setup_logging() -> None:
     )
 
 
-def _db_path(cwd: Path) -> Path:
-    db_dir = cwd / ".harness"
+def _db_path(root: Path) -> Path:
+    db_dir = root / ".harness"
     db_dir.mkdir(exist_ok=True)
     return db_dir / "sessions.db"
+
+
+def _resolve_root(workspace: str | None) -> Path:
+    """``--workspace X`` is equivalent to ``cd X && harness``."""
+    if not workspace or not workspace.strip():
+        return Path.cwd()
+    root = Path(workspace).expanduser().resolve()
+    if not root.is_dir():
+        print(
+            f"Error: --workspace {workspace!r} is not an existing directory.",
+            file=sys.stderr,
+        )
+        raise typer.Exit(1)
+    return root
 
 
 # ---------------------------------------------------------------------------
@@ -51,13 +68,18 @@ def run(
     api_key: str | None = typer.Option(None, "--api-key", help="API key for the provider."),
     continue_: bool = typer.Option(False, "--continue", help="Resume the latest session."),
     resume: str | None = typer.Option(None, "--resume", help="Resume a session by full id or unambiguous prefix."),
+    workspace: str | None = typer.Option(
+        None,
+        "--workspace",
+        help="Working folder to run in; discovery, harness.toml, sessions, and the agent backend follow it. A relative path resolves against the current directory; ~ expands.",
+    ),
 ) -> None:
     """Run a prompt or start an interactive REPL."""
     _setup_logging()
 
-    cwd = Path.cwd()
+    root = _resolve_root(workspace)
     config = resolve_config(
-        cwd,
+        root,
         provider=provider,
         model=model,
         base_url=base_url,
@@ -68,7 +90,7 @@ def run(
         print("Error: prompt cannot be empty.", file=sys.stderr)
         raise typer.Exit(1)
 
-    db = _db_path(cwd)
+    db = _db_path(root)
 
     async def _run() -> None:
         async with connect(db) as db_conn:
@@ -88,7 +110,7 @@ def run(
                 thread_id = uuid4().hex
 
             async with AsyncSqliteSaver.from_conn_string(str(db)) as checkpointer:
-                agent = await build_agent(config, cwd, checkpointer=checkpointer)
+                agent = await build_agent(config, root, checkpointer=checkpointer)
                 user_prompt = prompt_arg if prompt is None else prompt
                 if user_prompt is not None:
                     await run_once(agent, user_prompt, thread_id, db_conn=db_conn)
@@ -104,10 +126,16 @@ def run(
 
 
 @app.command(name="sessions")
-def list_sessions() -> None:
+def list_sessions(
+    workspace: str | None = typer.Option(
+        None,
+        "--workspace",
+        help="Working folder to list sessions from. A relative path resolves against the current directory; ~ expands.",
+    ),
+) -> None:
     """List recent persisted sessions."""
     _setup_logging()
-    db = _db_path(Path.cwd())
+    db = _db_path(_resolve_root(workspace))
 
     async def _list() -> None:
         async with connect(db) as db_conn:
@@ -255,7 +283,39 @@ def users_revoke(
 # dispatch
 # ---------------------------------------------------------------------------
 
-_KNOWN_SUBCOMMANDS = {"run", "sessions", "serve", "users", "--help", "-h"}
+_KNOWN_SUBCOMMANDS = {"run", "sessions", "serve", "users"}
+
+# keep in sync with value-taking typer.Option declarations above
+_OPTIONS_WITH_VALUE = {
+    "--workspace",
+    "--provider",
+    "--model",
+    "--base-url",
+    "--api-key",
+    "--resume",
+    "--host",
+    "--port",
+    "-p",
+    "--prompt",
+}
+
+
+def _first_positional_index(argv: list[str]) -> int | None:
+    """Return the index of the first non-option token after the program name.
+
+    Options that take a value are skipped together with that value;
+    ``--opt=value`` and boolean flags advance one token each.
+    """
+    i = 1
+    while i < len(argv):
+        token = argv[i]
+        if not token.startswith("-"):
+            return i
+        if token in _OPTIONS_WITH_VALUE:
+            i += 2  # skip the option and its value
+        else:
+            i += 1  # boolean flag or self-contained --opt=value
+    return None
 
 
 def main() -> None:
@@ -265,13 +325,27 @@ def main() -> None:
     command so existing one-shot and REPL usage keeps working after the
     ``sessions``, ``serve``, and ``users`` subcommands were added.
     """
-    if len(sys.argv) > 1 and sys.argv[1] in {"sessions", "serve", "users"}:
+    if len(sys.argv) <= 1:
+        sys.argv.insert(1, "run")
         app()
         return
 
-    # For all other invocations, default to the run command.
-    if len(sys.argv) <= 1 or sys.argv[1] not in _KNOWN_SUBCOMMANDS:
-        sys.argv.insert(1, "run")
+    idx = _first_positional_index(sys.argv)
+
+    if idx is not None and sys.argv[idx] in _KNOWN_SUBCOMMANDS and "--" not in sys.argv[1:idx]:
+        # Move the subcommand ahead of any leading options so typer parses it.
+        if idx != 1:
+            sys.argv.insert(1, sys.argv.pop(idx))
+        app()
+        return
+
+    # ``harness --help``/``-h`` shows the top-level help; everything else
+    # (a prompt, or options only) defaults to the run command.
+    if idx is None and set(sys.argv[1:]) <= {"--help", "-h"}:
+        app()
+        return
+
+    sys.argv.insert(1, "run")
     app()
 
 
