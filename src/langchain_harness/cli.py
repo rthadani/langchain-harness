@@ -16,7 +16,9 @@ from rich.markup import escape
 from langchain_harness import memory
 from langchain_harness.agent_builder import build_agent, build_model
 from langchain_harness.config import resolve_config
-from langchain_harness.runner import repl, run_once
+from langchain_harness.discovery import discover_memory
+from langchain_harness.memory import eval_session
+from langchain_harness.runner import _print_eval_result, repl, run_once
 from langchain_harness import sessions
 from langchain_harness.sessions import connect, get_latest, resolve_prefix
 
@@ -125,6 +127,7 @@ def run(
                         db_conn=db_conn,
                         model=model,
                         memory_root=root,
+                        prompts=config.prompts,
                     )
                 else:
                     await repl(
@@ -133,6 +136,7 @@ def run(
                         db_conn=db_conn,
                         model=model,
                         memory_root=root,
+                        prompts=config.prompts,
                     )
 
     asyncio.run(_run())
@@ -227,6 +231,63 @@ def memory_command(
                 console.print("[yellow]Deleted.[/yellow]")
             continue
         console.print("[dim]Skipped.[/dim]")
+
+
+# ---------------------------------------------------------------------------
+# eval command
+# ---------------------------------------------------------------------------
+
+
+@app.command(name="eval")
+def eval_command(
+    session_id: str = typer.Argument(..., metavar="SESSION", help="Session id or unambiguous prefix to evaluate."),
+    provider: str | None = typer.Option(None, "--provider", help="Model provider."),
+    model: str | None = typer.Option(None, "--model", help="Model name."),
+    base_url: str | None = typer.Option(None, "--base-url", help="Custom base URL."),
+    api_key: str | None = typer.Option(None, "--api-key", help="API key for the provider."),
+    workspace: str | None = typer.Option(
+        None,
+        "--workspace",
+        help="Working folder. A relative path resolves against the current directory; ~ expands.",
+    ),
+) -> None:
+    """Score a completed session on scope adherence, task completion, and tool use quality."""
+    _setup_logging()
+    root = _resolve_root(workspace)
+    config = resolve_config(root, provider=provider, model=model, base_url=base_url, api_key=api_key)
+    db = _db_path(root)
+    console = Console()
+
+    async def _eval() -> None:
+        async with connect(db) as db_conn:
+            try:
+                thread_id = await resolve_prefix(db_conn, session_id)
+            except ValueError as exc:
+                print(f"Error: {exc}", file=sys.stderr)
+                raise typer.Exit(1)
+
+        async with AsyncSqliteSaver.from_conn_string(str(db)) as checkpointer:
+            model_obj = build_model(config)
+            agent = await build_agent(config, root, checkpointer=checkpointer, model=model_obj)
+
+            memory_texts: list[str] = []
+            for path in discover_memory(root):
+                try:
+                    memory_texts.append(path.read_text(encoding="utf-8"))
+                except OSError:
+                    pass
+
+            result = await eval_session(
+                model_obj, agent, thread_id,
+                memory_texts=memory_texts,
+                system_prompt=config.prompts.eval,
+            )
+            if result is None:
+                console.print("Nothing to evaluate.")
+                return
+            _print_eval_result(console, result)
+
+    asyncio.run(_eval())
 
 
 # ---------------------------------------------------------------------------
@@ -359,7 +420,7 @@ def users_revoke(
 # dispatch
 # ---------------------------------------------------------------------------
 
-_KNOWN_SUBCOMMANDS = {"run", "sessions", "serve", "users", "memory"}
+_KNOWN_SUBCOMMANDS = {"run", "sessions", "serve", "users", "memory", "eval"}
 
 # keep in sync with value-taking typer.Option declarations above
 _OPTIONS_WITH_VALUE = {

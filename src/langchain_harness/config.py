@@ -15,6 +15,22 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
+class PromptsConfig:
+    """User-configurable prompt overrides for the harness.
+
+    Each field maps to a prompt key in ``[prompts]`` in harness.toml.
+    Values may be inline text or ``file:<relative-path>`` to load from a file.
+    ``None`` means use the built-in default.
+    """
+
+    system: str | None = None
+    summarize: str | None = None
+    eval: str | None = None
+    compact: str | None = None
+    compact_nudge: str | None = None
+
+
+@dataclass(frozen=True)
 class CompactionConfig:
     """User-configurable conversation compaction thresholds.
 
@@ -46,6 +62,7 @@ class Config:
     api_key: str | None = None
     compaction: CompactionConfig = field(default_factory=CompactionConfig)
     server: ServerConfig = field(default_factory=ServerConfig)
+    prompts: PromptsConfig = field(default_factory=PromptsConfig)
 
 
 def _load_toml(path: Path) -> dict[str, Any]:
@@ -70,6 +87,36 @@ def _parse_int(value: Any) -> int | None:
     except (TypeError, ValueError):
         return None
     return parsed if parsed > 0 else None
+
+
+def _resolve_prompt_value(value: Any, root: Path) -> str | None:
+    """Resolve a prompt value from TOML: inline text or ``file:<path>`` reference."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    stripped = value.strip()
+    if stripped.startswith("file:"):
+        rel = stripped[len("file:"):].strip()
+        path = (root / rel).resolve()
+        try:
+            return path.read_text(encoding="utf-8").strip() or None
+        except OSError as exc:
+            logger.warning("Could not read prompt file %s: %s; using built-in default", path, exc)
+            return None
+    return stripped
+
+
+def _resolve_prompts(toml_data: dict[str, Any], root: Path) -> PromptsConfig:
+    """Build a ``PromptsConfig`` from the ``[prompts]`` TOML section."""
+    section = toml_data.get("prompts", {})
+    if not isinstance(section, dict):
+        section = {}
+    return PromptsConfig(
+        system=_resolve_prompt_value(section.get("system"), root),
+        summarize=_resolve_prompt_value(section.get("summarize"), root),
+        eval=_resolve_prompt_value(section.get("eval"), root),
+        compact=_resolve_prompt_value(section.get("compact"), root),
+        compact_nudge=_resolve_prompt_value(section.get("compact_nudge"), root),
+    )
 
 
 def _resolve_compaction(toml_data: dict[str, Any]) -> CompactionConfig:
@@ -192,6 +239,7 @@ def resolve_config(
 
     compaction = _resolve_compaction(toml)
     server = _resolve_server(toml)
+    prompts = _resolve_prompts(toml, cwd)
 
     return Config(
         provider=resolved_provider,
@@ -200,4 +248,5 @@ def resolve_config(
         api_key=resolved_api_key,
         compaction=compaction,
         server=server,
+        prompts=prompts,
     )

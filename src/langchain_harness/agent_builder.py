@@ -28,10 +28,10 @@ logger = logging.getLogger(__name__)
 # Seconds to wait for a single MCP server to return its tool list.
 _MCP_TOOLS_TIMEOUT = 30
 
-# Nudge appended to the tool middleware so the model knows when to call it.
-_COMPACT_TOOL_NUDGE = (
-    "Use the compact_conversation tool when the user asks to compact the conversation."
-)
+from langchain_harness import prompts as _prompts
+
+_COMPACT_TOOL_NUDGE = _prompts.load("compact_nudge")
+_DEFAULT_SYSTEM_PROMPT = _prompts.load("system")
 
 # Known Claude-style model aliases for subagent frontmatter.  Values are passed
 # verbatim to ``init_chat_model`` as ``provider:model`` strings.
@@ -135,6 +135,7 @@ def _build_summarization_middleware(
     model: BaseChatModel,
     backend: Any,
     compaction: CompactionConfig,
+    compact_nudge: str | None = None,
 ) -> list[Any] | None:
     """Build compaction middleware when a threshold is configured.
 
@@ -157,7 +158,7 @@ def _build_summarization_middleware(
     )
     tool_middleware = SummarizationToolMiddleware(
         summarization,
-        system_prompt=_COMPACT_TOOL_NUDGE,
+        system_prompt=compact_nudge or _COMPACT_TOOL_NUDGE,
     )
     return [summarization, tool_middleware]
 
@@ -280,12 +281,14 @@ async def build_agent(
     else:
         agent_backend = _build_backend(cwd, enable_shell=enable_shell, root_dir=root_dir)
 
-    middleware = _build_summarization_middleware(_model, agent_backend, config.compaction)
+    middleware = _build_summarization_middleware(
+        _model, agent_backend, config.compaction, compact_nudge=config.prompts.compact_nudge
+    )
 
     agent_kwargs: dict[str, Any] = {
         "model": _model,
         "tools": mcp_tools or None,
-        "system_prompt": "You are a helpful coding assistant. Work in the user's project directory.",
+        "system_prompt": config.prompts.system or _DEFAULT_SYSTEM_PROMPT,
         "subagents": subagents or None,
         "skills": skills,
         "memory": [str(p) for p in memory_paths] or None,

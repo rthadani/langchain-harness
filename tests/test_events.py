@@ -113,3 +113,41 @@ async def test_stream_turn_events_empty_stream_still_yields_done() -> None:
 
     assert len(events) == 1
     assert events[0]["type"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_stream_turn_events_filters_summarization_tokens() -> None:
+    agent = _FakeAgent([
+        {
+            "event": "on_chat_model_stream",
+            "metadata": {"langgraph_node": "SummarizationMiddleware.before_model"},
+            "data": {"chunk": _Chunk("internal summary text")},
+        },
+        {
+            "event": "on_chat_model_stream",
+            "metadata": {"langgraph_node": "model"},
+            "data": {"chunk": _Chunk("visible reply")},
+        },
+    ])
+
+    events = [e async for e in stream_turn_events(agent, "hi", "thread-1")]
+
+    token_events = [e for e in events if e["type"] == "token"]
+    assert len(token_events) == 1
+    assert token_events[0]["text"] == "visible reply"
+
+
+@pytest.mark.asyncio
+async def test_stream_turn_events_passes_tokens_without_node_metadata() -> None:
+    agent = _FakeAgent([
+        {
+            "event": "on_chat_model_stream",
+            "data": {"chunk": _Chunk("hello")},
+        },
+    ])
+
+    events = [e async for e in stream_turn_events(agent, "hi", "thread-1")]
+
+    token_events = [e for e in events if e["type"] == "token"]
+    assert len(token_events) == 1
+    assert token_events[0]["text"] == "hello"

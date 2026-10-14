@@ -10,9 +10,11 @@ from langchain_harness.frontmatter import parse_frontmatter
 from langchain_harness.memory import (
     _CONVERSATION_CHAR_LIMIT,
     _TRUNCATION_MARKER,
+    EvalResult,
     active_memory_path,
     approve_note,
     capture_session_note,
+    eval_session,
     inbox_dir,
     list_inbox,
     reject_note,
@@ -266,6 +268,108 @@ def test_reject_note_deletes_only_inbox_file(tmp_path) -> None:
 
 def test_reject_note_missing_returns_false(tmp_path) -> None:
     assert reject_note(tmp_path, "nope") is False
+
+
+# --- eval_session ---
+
+_VALID_EVAL_JSON = """{
+    "scope_adherence": 8,
+    "scope_reason": "stayed on topic",
+    "task_completion": 9,
+    "task_reason": "fully done",
+    "tool_use_quality": 7,
+    "tool_use_reason": "one redundant read",
+    "verdict": "good session"
+}"""
+
+
+@pytest.mark.asyncio
+async def test_eval_session_returns_result_on_valid_json() -> None:
+    model = _FakeModel(_VALID_EVAL_JSON)
+    agent = _FakeAgent([_FakeMsg("human", "do it"), _FakeMsg("ai", "done")])
+
+    result = await eval_session(model, agent, "t1")
+
+    assert isinstance(result, EvalResult)
+    assert result.scope_adherence == 8
+    assert result.scope_reason == "stayed on topic"
+    assert result.task_completion == 9
+    assert result.task_reason == "fully done"
+    assert result.tool_use_quality == 7
+    assert result.tool_use_reason == "one redundant read"
+    assert result.verdict == "good session"
+
+
+@pytest.mark.asyncio
+async def test_eval_session_strips_markdown_fences() -> None:
+    fenced = f"```json\n{_VALID_EVAL_JSON}\n```"
+    model = _FakeModel(fenced)
+    agent = _FakeAgent([_FakeMsg("human", "do it"), _FakeMsg("ai", "done")])
+
+    result = await eval_session(model, agent, "t1")
+
+    assert result is not None
+    assert result.scope_adherence == 8
+
+
+@pytest.mark.asyncio
+async def test_eval_session_skips_empty_session() -> None:
+    model = _FakeModel(_VALID_EVAL_JSON)
+    assert await eval_session(model, _FakeAgent([]), "t1") is None
+    assert model.calls == []
+
+
+@pytest.mark.asyncio
+async def test_eval_session_skips_human_only_session() -> None:
+    model = _FakeModel(_VALID_EVAL_JSON)
+    agent = _FakeAgent([_FakeMsg("human", "hello")])
+    assert await eval_session(model, agent, "t1") is None
+    assert model.calls == []
+
+
+@pytest.mark.asyncio
+async def test_eval_session_returns_none_on_invalid_json() -> None:
+    model = _FakeModel("not json at all")
+    agent = _FakeAgent([_FakeMsg("human", "do it"), _FakeMsg("ai", "done")])
+    assert await eval_session(model, agent, "t1") is None
+
+
+@pytest.mark.asyncio
+async def test_eval_session_returns_none_on_missing_keys() -> None:
+    model = _FakeModel('{"scope_adherence": 8}')
+    agent = _FakeAgent([_FakeMsg("human", "do it"), _FakeMsg("ai", "done")])
+    assert await eval_session(model, agent, "t1") is None
+
+
+@pytest.mark.asyncio
+async def test_eval_session_returns_none_when_model_raises() -> None:
+    class _BrokenModel:
+        async def ainvoke(self, messages: list[Any]) -> Any:
+            raise RuntimeError("model down")
+
+    agent = _FakeAgent([_FakeMsg("human", "do it"), _FakeMsg("ai", "done")])
+    assert await eval_session(_BrokenModel(), agent, "t1") is None
+
+
+@pytest.mark.asyncio
+async def test_eval_session_includes_memory_texts_in_prompt() -> None:
+    model = _FakeModel(_VALID_EVAL_JSON)
+    agent = _FakeAgent([_FakeMsg("human", "do it"), _FakeMsg("ai", "done")])
+
+    await eval_session(model, agent, "t1", memory_texts=["scope: coding only"])
+
+    human_msg = model.calls[0][1]
+    assert "scope: coding only" in human_msg.content
+
+
+@pytest.mark.asyncio
+async def test_eval_session_passes_thread_id_in_config() -> None:
+    model = _FakeModel(_VALID_EVAL_JSON)
+    agent = _FakeAgent([_FakeMsg("human", "do it"), _FakeMsg("ai", "done")])
+
+    await eval_session(model, agent, "thread-xyz")
+
+    assert agent.configs == [{"configurable": {"thread_id": "thread-xyz"}}]
 
 
 # --- capture_session_note ---

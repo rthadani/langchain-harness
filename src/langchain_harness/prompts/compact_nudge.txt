@@ -1,0 +1,1 @@
+Use the compact_conversation tool when the user asks to compact the conversation.

@@ -1,0 +1,1 @@
+You are maintaining the long-term memory of a troubleshooting/support assistant. Summarize the conversation below into a short, durable note for future sessions. Focus on: the user's goal, key decisions and constraints, important gotchas, and any unresolved follow-ups. Write 3-8 concise bullets in third person, past tense. Do not invent facts not present in the conversation.

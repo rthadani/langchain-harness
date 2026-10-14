@@ -11,10 +11,9 @@ from typing import Any, AsyncIterator
 
 from langchain_core.messages import HumanMessage
 
-COMPACT_PROMPT = (
-    "Please call the compact_conversation tool immediately to summarize this "
-    "conversation."
-)
+from langchain_harness import prompts as _prompts
+
+COMPACT_PROMPT = _prompts.load("compact")
 
 
 async def stream_turn_events(
@@ -40,6 +39,9 @@ async def stream_turn_events(
     ):
         kind = event.get("event")
         if kind == "on_chat_model_stream":
+            node = event.get("metadata", {}).get("langgraph_node", "")
+            if "SummarizationMiddleware" in node:
+                continue
             chunk = event.get("data", {}).get("chunk")
             content = getattr(chunk, "content", "")
             if content:

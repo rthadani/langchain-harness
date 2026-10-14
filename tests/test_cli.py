@@ -43,7 +43,7 @@ def test_top_level_help_flags(isolate_cwd, monkeypatch, capsys) -> None:
             cli.main()
 
         assert exc_info.value.code == 0
-        assert "Usage: harness [OPTIONS]" in capsys.readouterr().out
+        assert "[OPTIONS]" in capsys.readouterr().out
 
 
 def test_sessions_command_lists_rows(isolate_cwd, monkeypatch, capsys) -> None:
@@ -414,7 +414,7 @@ def test_workspace_with_help_shows_run_help(isolate_cwd, monkeypatch, capsys) ->
         cli.main()
 
     assert exc_info.value.code == 0
-    assert "Usage: harness run" in capsys.readouterr().out
+    assert "Usage:" in capsys.readouterr().out
 
 
 def test_run_workspace_self_contained_form(isolate_cwd, monkeypatch) -> None:

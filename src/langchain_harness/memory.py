@@ -8,6 +8,7 @@ file ``<root>/.harness/memory/notes.md`` that future sessions auto-load.
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -17,18 +18,12 @@ from typing import Any
 import yaml
 from langchain_core.messages import HumanMessage, SystemMessage
 
+from langchain_harness import prompts as _prompts
 from langchain_harness.frontmatter import parse_frontmatter
 
 logger = logging.getLogger(__name__)
 
-_SUMMARIZE_SYSTEM_PROMPT = (
-    "You are maintaining the long-term memory of a coding assistant. "
-    "Summarize the conversation below into a short, durable note for future "
-    "sessions. Focus on: the user's goal, key decisions and constraints, "
-    "important gotchas, and any unresolved follow-ups. Write 3-8 concise "
-    "bullets in third person, past tense. Do not invent facts not present in "
-    "the conversation."
-)
+_SUMMARIZE_SYSTEM_PROMPT = _prompts.load("summarize")
 
 # Messages are truncated to this many characters before rendering so a long
 # session cannot blow past the summarization model's context window.
@@ -40,6 +35,19 @@ _CONVERSATION_CHAR_LIMIT = 16000
 _TRUNCATION_MARKER = "\n...[truncated]"
 
 _DEFAULT_TITLE = "Untitled session"
+
+_EVAL_SYSTEM_PROMPT = _prompts.load("eval")
+
+
+@dataclass(frozen=True)
+class EvalResult:
+    scope_adherence: int
+    scope_reason: str
+    task_completion: int
+    task_reason: str
+    tool_use_quality: int
+    tool_use_reason: str
+    verdict: str
 
 
 @dataclass(frozen=True)
@@ -231,6 +239,7 @@ async def summarize_session(
     thread_id: str,
     *,
     title: str = "",
+    system_prompt: str | None = None,
 ) -> str | None:
     """Summarize a session's messages into a durable note.
 
@@ -248,7 +257,7 @@ async def summarize_session(
 
         result = await model.ainvoke(
             [
-                SystemMessage(content=_SUMMARIZE_SYSTEM_PROMPT),
+                SystemMessage(content=system_prompt or _SUMMARIZE_SYSTEM_PROMPT),
                 HumanMessage(
                     content=(
                         f"Session title: {title}\n\n"
@@ -264,6 +273,65 @@ async def summarize_session(
         return None
 
 
+async def eval_session(
+    model: Any,
+    agent: Any,
+    thread_id: str,
+    *,
+    memory_texts: list[str] | None = None,
+    system_prompt: str | None = None,
+) -> EvalResult | None:
+    """Evaluate a session on scope adherence, task completion, and tool use quality.
+
+    Returns None when the session has no substantive content or when the model
+    call fails for any reason. Never raises.
+    """
+    try:
+        state = await agent.aget_state({"configurable": {"thread_id": thread_id}})
+        values = getattr(state, "values", None)
+        messages: list[Any] = []
+        if isinstance(values, dict):
+            messages = values.get("messages") or []
+        if not _has_substantive_content(messages):
+            return None
+
+        parts: list[str] = []
+        if memory_texts:
+            for text in memory_texts:
+                if text.strip():
+                    parts.append(f"Project instructions:\n{text.strip()}")
+        parts.append(f"Conversation:\n{_render_conversation(messages)}")
+
+        result = await model.ainvoke(
+            [
+                SystemMessage(content=system_prompt or _EVAL_SYSTEM_PROMPT),
+                HumanMessage(content="\n\n".join(parts)),
+            ]
+        )
+        raw = _content_text(getattr(result, "content", result))
+        # Strip markdown fences if the model wrapped the JSON anyway.
+        lines = raw.strip().splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].startswith("```"):
+            lines = lines[:-1]
+        raw = "\n".join(lines)
+
+        data = json.loads(raw)
+        return EvalResult(
+            scope_adherence=int(data["scope_adherence"]),
+            scope_reason=str(data["scope_reason"]),
+            task_completion=int(data["task_completion"]),
+            task_reason=str(data["task_reason"]),
+            tool_use_quality=int(data["tool_use_quality"]),
+            tool_use_reason=str(data["tool_use_reason"]),
+            verdict=str(data["verdict"]),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not evaluate session %s: %s", thread_id, exc)
+        return None
+
+
 async def capture_session_note(
     model: Any,
     agent: Any,
@@ -272,6 +340,7 @@ async def capture_session_note(
     *,
     title: str = "",
     user_id: str | None = None,
+    system_prompt: str | None = None,
 ) -> Path | None:
     """Summarize a session and queue the result in the review inbox.
 
@@ -279,7 +348,7 @@ async def capture_session_note(
     summarizing or summarization fails. Never raises.
     """
     try:
-        summary = await summarize_session(model, agent, thread_id, title=title)
+        summary = await summarize_session(model, agent, thread_id, title=title, system_prompt=system_prompt)
         if not summary:
             return None
         return write_inbox_note(

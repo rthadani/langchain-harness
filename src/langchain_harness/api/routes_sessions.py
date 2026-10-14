@@ -174,9 +174,11 @@ async def compact_session(
     agent = await request.app.state.get_agent(user["user_id"])
     db_path = _user_db_path(request, user["user_id"])
 
+    compact_prompt = getattr(request.app.state.config.prompts, "compact", None) or COMPACT_PROMPT
+
     async def _stream():
         try:
-            async for chunk in stream_sse_response(agent, COMPACT_PROMPT, thread_id, request):
+            async for chunk in stream_sse_response(agent, compact_prompt, thread_id, request):
                 yield chunk
         finally:
             async with connect(db_path) as conn:
@@ -205,6 +207,7 @@ async def summarize_session_endpoint(
     if model is None:
         return {"status": "skipped", "reason": "no model available"}
 
+    summarize_prompt = getattr(request.app.state.config.prompts, "summarize", None)
     note = await capture_session_note(
         model,
         agent,
@@ -212,6 +215,7 @@ async def summarize_session_endpoint(
         request.app.state.cwd,
         title=title,
         user_id=user["user_id"],
+        system_prompt=summarize_prompt,
     )
     if note is None:
         return {"status": "skipped", "reason": "not captured"}

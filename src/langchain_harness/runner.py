@@ -12,8 +12,10 @@ from rich.markup import escape
 from rich.text import Text
 
 from langchain_harness import sessions
+from langchain_harness.config import PromptsConfig
+from langchain_harness.discovery import discover_memory
 from langchain_harness.events import COMPACT_PROMPT, stream_turn_events
-from langchain_harness.memory import capture_session_note
+from langchain_harness.memory import EvalResult, capture_session_note, eval_session
 
 
 def _render_tool_call(console: Console, name: str, input_data: Any) -> None:
@@ -70,6 +72,7 @@ async def run_once(
     db_conn: aiosqlite.Connection | None = None,
     model: Any | None = None,
     memory_root: Path | None = None,
+    prompts: PromptsConfig | None = None,
 ) -> None:
     """Run a single user prompt and stream the result.
 
@@ -90,7 +93,10 @@ async def run_once(
         await _upsert_session(db_conn, thread_id, title=prompt)
         # Capture memory before anything else can clear the session state.
         if model is not None and memory_root is not None:
-            await capture_session_note(model, agent, thread_id, memory_root, title=prompt)
+            await capture_session_note(
+                model, agent, thread_id, memory_root, title=prompt,
+                system_prompt=prompts.summarize if prompts else None,
+            )
 
 
 async def _list_sessions_command(
@@ -131,6 +137,7 @@ async def _compact_command(
     thread_id: str,
     console: Console,
     db_conn: aiosqlite.Connection | None,
+    compact_prompt: str | None = None,
 ) -> None:
     """Run a turn that asks the model to compact the conversation.
 
@@ -148,7 +155,7 @@ async def _compact_command(
     try:
         await _stream_turn(
             agent,
-            COMPACT_PROMPT,
+            compact_prompt or COMPACT_PROMPT,
             thread_id,
             console,
             tool_end_callback=_on_tool_end,
@@ -172,6 +179,49 @@ async def _compact_command(
     await _upsert_session(db_conn, thread_id, title="/compact")
 
 
+def _print_eval_result(console: Console, result: EvalResult) -> None:
+    label_w = 16
+    console.print(
+        f"{'Scope adherence':<{label_w}} {result.scope_adherence:>2}/10  {escape(result.scope_reason)}"
+    )
+    console.print(
+        f"{'Task completion':<{label_w}} {result.task_completion:>2}/10  {escape(result.task_reason)}"
+    )
+    console.print(
+        f"{'Tool use quality':<{label_w}} {result.tool_use_quality:>2}/10  {escape(result.tool_use_reason)}"
+    )
+    console.print(f"\nVerdict: {escape(result.verdict)}")
+
+
+async def _eval_command(
+    agent: Any,
+    thread_id: str,
+    console: Console,
+    model: Any | None,
+    memory_root: Path | None,
+    prompts: PromptsConfig | None = None,
+) -> None:
+    if model is None:
+        console.print("[red]Error:[/red] eval is not available (no model configured)")
+        return
+    memory_texts: list[str] = []
+    if memory_root is not None:
+        for path in discover_memory(memory_root):
+            try:
+                memory_texts.append(path.read_text(encoding="utf-8"))
+            except OSError:
+                pass
+    result = await eval_session(
+        model, agent, thread_id,
+        memory_texts=memory_texts,
+        system_prompt=prompts.eval if prompts else None,
+    )
+    if result is None:
+        console.print("Nothing to evaluate.")
+        return
+    _print_eval_result(console, result)
+
+
 async def _summarize_command(
     agent: Any,
     thread_id: str,
@@ -179,13 +229,15 @@ async def _summarize_command(
     model: Any | None,
     memory_root: Path | None,
     title: str,
+    prompts: PromptsConfig | None = None,
 ) -> None:
     """Queue a durable memory note for the current session."""
     if model is None or memory_root is None:
         console.print("[red]Error:[/red] summarization is not available")
         return
     note = await capture_session_note(
-        model, agent, thread_id, memory_root, title=title
+        model, agent, thread_id, memory_root, title=title,
+        system_prompt=prompts.summarize if prompts else None,
     )
     if note is None:
         console.print("Nothing to summarize.")
@@ -204,6 +256,7 @@ async def repl(
     db_conn: aiosqlite.Connection | None = None,
     model: Any | None = None,
     memory_root: Path | None = None,
+    prompts: PromptsConfig | None = None,
 ) -> None:
     """Run an interactive multi-turn REPL."""
     if console is None:
@@ -211,7 +264,7 @@ async def repl(
     console.print(
         "[bold green]harness[/bold green] interactive mode. "
         "Type /exit or press Ctrl-D to quit. "
-        "Commands: /sessions, /resume <id>, /compact, /summarize."
+        "Commands: /sessions, /resume <id>, /compact, /summarize, /eval."
     )
 
     first_prompt: str | None = None
@@ -240,7 +293,10 @@ async def repl(
                 console.print(f"[dim]Resumed session {thread_id}.[/dim]")
             continue
         if lower == "/compact":
-            await _compact_command(agent, thread_id, console, db_conn)
+            await _compact_command(
+                agent, thread_id, console, db_conn,
+                compact_prompt=prompts.compact if prompts else None,
+            )
             continue
         if lower == "/summarize":
             await _summarize_command(
@@ -250,7 +306,11 @@ async def repl(
                 model,
                 memory_root,
                 first_prompt or "REPL session",
+                prompts=prompts,
             )
+            continue
+        if lower == "/eval":
+            await _eval_command(agent, thread_id, console, model, memory_root, prompts=prompts)
             continue
 
         if first_prompt is None:
