@@ -11,7 +11,7 @@ from typing import Any
 import aiosqlite
 from fastapi import FastAPI
 
-from langchain_harness.agent_builder import _build_backend, _build_model, build_agent
+from langchain_harness.agent_builder import _build_backend, build_agent, build_model
 from langchain_harness.config import Config
 from langchain_harness.mcp_loader import load_mcp_connections
 from langchain_harness.api.routes_sessions import router as sessions_router
@@ -41,7 +41,7 @@ class UserAgentCache:
 
     async def initialize_shared(self) -> None:
         """Build the shared model and load MCP tools once at startup."""
-        self.shared_model = _build_model(self.config)
+        self.shared_model = build_model(self.config)
 
         from langchain_mcp_adapters.client import MultiServerMCPClient
 

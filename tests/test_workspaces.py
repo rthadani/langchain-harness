@@ -116,3 +116,29 @@ def test_provision_no_skills_or_memory(tmp_path: Path) -> None:
     assert workspace.is_dir()
     assert get_workspace_skills_dir(workspace) is None
     assert get_workspace_memory_paths(workspace) == []
+
+
+def test_provision_syncs_approved_memory_notes(tmp_path: Path) -> None:
+    notes = tmp_path / ".harness" / "memory" / "notes.md"
+    notes.parent.mkdir(parents=True)
+    notes.write_text("## First\n\n- one\n", encoding="utf-8")
+
+    workspace = provision_user_workspace(tmp_path, "u123")
+
+    copied = workspace / ".harness" / "memory" / "notes.md"
+    assert copied.read_text(encoding="utf-8") == "## First\n\n- one\n"
+    assert get_workspace_memory_paths(workspace) == [copied]
+
+
+def test_provision_does_not_copy_memory_inbox(tmp_path: Path) -> None:
+    inbox = tmp_path / ".harness" / "memory" / "inbox"
+    inbox.mkdir(parents=True)
+    (inbox / "t1.md").write_text("pending", encoding="utf-8")
+    (tmp_path / ".harness" / "memory" / "notes.md").write_text(
+        "## Approved\n", encoding="utf-8"
+    )
+
+    workspace = provision_user_workspace(tmp_path, "u123")
+
+    assert (workspace / ".harness" / "memory" / "notes.md").is_file()
+    assert not (workspace / ".harness" / "memory" / "inbox").exists()

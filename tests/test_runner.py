@@ -7,10 +7,13 @@ import pytest
 from rich.console import Console
 
 from langchain_harness import runner as runner_module
+from langchain_harness import memory as memory_module
+from langchain_harness.memory import inbox_dir, list_inbox
 from langchain_harness.runner import (
     _render_tool_call,
     _stream_turn,
     repl,
+    run_once,
 )
 
 
@@ -317,3 +320,146 @@ async def test_repl_compact_command_streams_compact_prompt(monkeypatch) -> None:
     await repl(agent, "thread-1")
 
     assert any("refused" in str(p[0][0]) for p in printed if p[0])
+
+
+# --- session memory ---
+
+
+class _MemoryMsg:
+    def __init__(self, msg_type: str, content: str) -> None:
+        self.type = msg_type
+        self.content = content
+
+
+class _MemoryState:
+    def __init__(self, messages: list[Any]) -> None:
+        self.values = {"messages": messages}
+
+
+class _MemoryAgent:
+    """Agent whose stored state holds one completed human/ai turn."""
+
+    def __init__(self, messages: list[Any] | None = None) -> None:
+        self.messages = messages if messages is not None else [
+            _MemoryMsg("human", "do a thing"),
+            _MemoryMsg("ai", "did it"),
+        ]
+
+    async def astream_events(self, *args, **kwargs):
+        if False:
+            yield
+
+    async def aget_state(self, config: Any) -> _MemoryState:
+        return _MemoryState(self.messages)
+
+
+class _MemoryModel:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def ainvoke(self, messages: list[Any]) -> Any:
+        self.calls += 1
+        return type("Result", (), {"content": "- summary bullet"})()
+
+
+@pytest.mark.asyncio
+async def test_run_once_writes_memory_note_when_configured(tmp_path) -> None:
+    agent = _MemoryAgent()
+    model = _MemoryModel()
+    console = Console(file=io.StringIO())
+
+    await run_once(
+        agent,
+        "do a thing",
+        "thread-mem",
+        console=console,
+        model=model,
+        memory_root=tmp_path,
+    )
+
+    assert model.calls == 1
+    notes = list_inbox(tmp_path)
+    assert len(notes) == 1
+    assert notes[0].thread_id == "thread-mem"
+    assert notes[0].title == "do a thing"
+    assert notes[0].summary == "- summary bullet"
+    # Pending until a human approves it.
+    assert not memory_module.active_memory_path(tmp_path).exists()
+
+
+@pytest.mark.asyncio
+async def test_run_once_skips_memory_without_memory_root(tmp_path) -> None:
+    agent = _MemoryAgent()
+    model = _MemoryModel()
+    console = Console(file=io.StringIO())
+
+    await run_once(agent, "do a thing", "thread-mem", console=console, model=model)
+
+    assert model.calls == 0
+    assert not inbox_dir(tmp_path).exists()
+
+
+@pytest.mark.asyncio
+async def test_repl_summarize_command_writes_note(monkeypatch, tmp_path) -> None:
+    agent = _MemoryAgent()
+    model = _MemoryModel()
+    _, printed = _patch_console(monkeypatch, ["do a thing", "/summarize", "/exit"])
+
+    await repl(agent, "thread-mem", model=model, memory_root=tmp_path)
+
+    notes = list_inbox(tmp_path)
+    assert len(notes) == 1
+    assert notes[0].thread_id == "thread-mem"
+    assert notes[0].title == "do a thing"
+    output = "\n".join(str(p[0][0]) for p in printed if p[0])
+    assert "thread-mem" in output
+
+
+@pytest.mark.asyncio
+async def test_repl_summarize_reports_nothing_to_summarize(monkeypatch, tmp_path) -> None:
+    agent = _MemoryAgent(messages=[_MemoryMsg("human", "hi")])
+    _, printed = _patch_console(monkeypatch, ["hi", "/summarize", "/exit"])
+
+    await repl(agent, "thread-mem", model=_MemoryModel(), memory_root=tmp_path)
+
+    output = "\n".join(str(p[0][0]) for p in printed if p[0])
+    assert "Nothing to summarize." in output
+    assert list_inbox(tmp_path) == []
+
+
+@pytest.mark.asyncio
+async def test_repl_summarize_reports_unavailable_without_model(monkeypatch, tmp_path) -> None:
+    agent = _MemoryAgent()
+    _, printed = _patch_console(monkeypatch, ["do a thing", "/summarize", "/exit"])
+
+    await repl(agent, "thread-mem", model=None, memory_root=tmp_path)
+
+    output = "\n".join(str(p[0][0]) for p in printed if p[0])
+    assert "not available" in output
+    assert list_inbox(tmp_path) == []
+
+
+@pytest.mark.asyncio
+async def test_repl_summarize_reports_unavailable_without_memory_root(monkeypatch, tmp_path) -> None:
+    agent = _MemoryAgent()
+    model = _MemoryModel()
+    _, printed = _patch_console(monkeypatch, ["do a thing", "/summarize", "/exit"])
+
+    await repl(agent, "thread-mem", model=model, memory_root=None)
+
+    output = "\n".join(str(p[0][0]) for p in printed if p[0])
+    assert "not available" in output
+    assert model.calls == 0
+    assert not inbox_dir(tmp_path).exists()
+
+
+@pytest.mark.asyncio
+async def test_repl_does_not_summarize_on_exit(monkeypatch, tmp_path) -> None:
+    agent = _MemoryAgent()
+    model = _MemoryModel()
+    _, _ = _patch_console(monkeypatch, ["do a thing", "/exit"])
+
+    await repl(agent, "thread-mem", model=model, memory_root=tmp_path)
+
+    assert model.calls == 0
+    assert list_inbox(tmp_path) == []

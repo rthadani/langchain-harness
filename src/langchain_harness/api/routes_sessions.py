@@ -19,6 +19,7 @@ from langchain_harness.api.schemas import (
 )
 from langchain_harness.api.sse import stream_sse_response
 from langchain_harness.events import COMPACT_PROMPT
+from langchain_harness.memory import capture_session_note
 from langchain_harness.sessions import connect, upsert
 from langchain_harness import sessions as sessions_module
 
@@ -83,8 +84,8 @@ async def list_sessions(
 
 async def _resolve_session(
     request: Request, user: dict[str, Any], session_id: str
-) -> str:
-    """Return the thread_id if the session exists in the user's db, else 404."""
+) -> dict[str, Any]:
+    """Return the session row if it exists in the user's db, else 404."""
     user_id = user["user_id"]
     db_path = _user_db_path(request, user_id)
     if not db_path.exists():
@@ -93,7 +94,7 @@ async def _resolve_session(
         session = await sessions_module.get_session(conn, session_id)
     if session is None:
         raise HTTPException(status_code=404, detail="Session not found")
-    return session["thread_id"]
+    return session
 
 
 @router.get("/{session_id}/history")
@@ -103,7 +104,8 @@ async def get_history(
     user: dict[str, Any] = Depends(get_current_user),
 ) -> list[HistoryMessage]:
     """Return message history for a session. 404 on foreign session."""
-    thread_id = await _resolve_session(request, user, session_id)
+    row = await _resolve_session(request, user, session_id)
+    thread_id = row["thread_id"]
     agent = await request.app.state.get_agent(user["user_id"])
 
     # Use the agent's checkpointer to retrieve state
@@ -139,7 +141,8 @@ async def send_message(
     user: dict[str, Any] = Depends(get_current_user),
 ) -> StreamingResponse:
     """Send a message and stream the agent's response as SSE."""
-    thread_id = await _resolve_session(request, user, session_id)
+    row = await _resolve_session(request, user, session_id)
+    thread_id = row["thread_id"]
     agent = await request.app.state.get_agent(user["user_id"])
 
     db_path = _user_db_path(request, user["user_id"])
@@ -166,7 +169,8 @@ async def compact_session(
     user: dict[str, Any] = Depends(get_current_user),
 ) -> StreamingResponse:
     """Stream the /compact flow as SSE. 404 on foreign session."""
-    thread_id = await _resolve_session(request, user, session_id)
+    row = await _resolve_session(request, user, session_id)
+    thread_id = row["thread_id"]
     agent = await request.app.state.get_agent(user["user_id"])
     db_path = _user_db_path(request, user["user_id"])
 
@@ -185,6 +189,35 @@ async def compact_session(
     )
 
 
+@router.post("/{session_id}/summarize")
+async def summarize_session_endpoint(
+    session_id: str,
+    request: Request,
+    user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, str]:
+    """Queue a durable memory note for a session. 404 on foreign session."""
+    row = await _resolve_session(request, user, session_id)
+    thread_id = row["thread_id"]
+    agent = await request.app.state.get_agent(user["user_id"])
+    title = row.get("title") or "API session"
+
+    model = getattr(request.app.state.agent_cache, "shared_model", None)
+    if model is None:
+        return {"status": "skipped", "reason": "no model available"}
+
+    note = await capture_session_note(
+        model,
+        agent,
+        thread_id,
+        request.app.state.cwd,
+        title=title,
+        user_id=user["user_id"],
+    )
+    if note is None:
+        return {"status": "skipped", "reason": "not captured"}
+    return {"status": "queued", "note_id": note.stem}
+
+
 @router.delete("/{session_id}")
 async def delete_session(
     session_id: str,
@@ -192,7 +225,8 @@ async def delete_session(
     user: dict[str, Any] = Depends(get_current_user),
 ) -> dict[str, str]:
     """Delete a session. 404 on foreign session."""
-    thread_id = await _resolve_session(request, user, session_id)
+    row = await _resolve_session(request, user, session_id)
+    thread_id = row["thread_id"]
     agent = await request.app.state.get_agent(user["user_id"])
 
     # Delete checkpoint data via the saver, then the sessions metadata row

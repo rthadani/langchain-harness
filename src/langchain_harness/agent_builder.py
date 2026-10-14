@@ -42,7 +42,7 @@ _MODEL_ALIASES = {
 }
 
 
-def _build_model(config: Config) -> BaseChatModel:
+def build_model(config: Config) -> BaseChatModel:
     """Initialize the chat model from the resolved configuration."""
     kwargs: dict[str, Any] = {"model_provider": config.provider}
     if config.base_url is not None:
@@ -224,7 +224,7 @@ async def build_agent(
     if model is not None:
         _model = model
     else:
-        _model = _build_model(config)
+        _model = build_model(config)
 
     # When any discovery override is set, we still need agent_paths from the
     # host cwd (subagents are parsed host-side, not from the workspace).

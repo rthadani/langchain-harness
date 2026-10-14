@@ -20,6 +20,9 @@ HARNESS_PROVIDER=openai HARNESS_MODEL=gpt-4o OPENAI_API_KEY=... uv run harness -
 # list persisted sessions
 uv run harness sessions
 
+# review pending session notes (approve to make them long-term memory)
+uv run harness memory --review
+
 # run against a different working folder (a relative path resolves against the current directory; ~ expands)
 uv run --project /path/to/langchain-harness harness --workspace ~/my-agents
 ```
@@ -39,7 +42,7 @@ Resolution order: **environment variables > CLI flags > `harness.toml`**.
 ### CLI flags
 
 - `--provider`, `--model`, `--base-url`, `--api-key`
-- `--workspace <path>` — working folder to run in (equivalent to `cd <path> && harness`). Discovery, `harness.toml`, `sessions.db`, and the agent backend all follow it. A relative path resolves against the current directory, and `~` expands. Applies to `run` and `sessions` only (not `serve` or `users`).
+- `--workspace <path>` — working folder to run in (equivalent to `cd <path> && harness`). Discovery, `harness.toml`, `sessions.db`, and the agent backend all follow it. A relative path resolves against the current directory, and `~` expands. Applies to `run`, `sessions`, and `memory` only (not `serve` or `users`).
 
 ### `harness.toml`
 
@@ -75,7 +78,7 @@ All discovery is relative to the **current working directory**. When `--workspac
 - **Skills:** `.claude/skills/<name>/SKILL.md` → passed to `create_deep_agent(skills=[...])`.
 - **Subagents:** `.claude/agents/*.md` → parsed as `SubAgent` definitions. Frontmatter must contain `name` and `description`; `model` is optional. The `model` value can be a provider-prefixed ID (`provider:model`), one of the aliases `sonnet`, `opus`, or `haiku`, or `inherit` to use the parent agent's model. Any `tools:` frontmatter list is ignored in this version.
   - **Subagent model resolution is independent:** a subagent `model:` value is passed straight to deepagents and resolved by the `langchain` provider it names. It does **not** inherit the harness's `base_url` or `api_key`; it hits that provider's default endpoint using its own env-var keys (e.g. `OPENAI_API_KEY` for an `openai:` model).
-- **Memory:** `CLAUDE.md` and `AGENTS.md` → passed as `memory=[...]` paths to `create_deep_agent`.
+- **Memory:** `CLAUDE.md`, `AGENTS.md`, and `.harness/memory/notes.md` (approved session notes) → passed as `memory=[...]` paths to `create_deep_agent`.
 - **MCP:** `mcp.json` in Claude Code format. Example:
 
 ```json
@@ -119,7 +122,32 @@ Sessions are persisted in `<cwd>/.harness/sessions.db` (or `<workspace>/.harness
 
 - `/sessions` — list saved sessions.
 - `/resume <id-or-prefix>` — switch to a different session mid-REPL.
+- `/summarize` — summarize the session so far and queue it for review in `.harness/memory/inbox/`.
 - `/compact` — ask the model to call the `compact_conversation` tool immediately. The tool's response is shown verbatim; if the conversation is below the configured trigger threshold the tool refuses and the refusal is displayed.
+
+## Session memory
+
+The harness can turn a session into a durable note that future sessions auto-load as long-term memory. Notes are LLM summaries, queued for human review before they are added.
+
+### Capturing a summary
+
+- One-shot `harness "..."` runs auto-summarize on completion (headless, so there is no prompt to trigger).
+- REPL: type `/summarize`.
+- Server API: `POST /v1/sessions/{id}/summarize`.
+
+### Reviewing notes
+
+Pending notes are written to `.harness/memory/inbox/<id>.md`.
+
+- `harness memory` — list pending notes.
+- `harness memory --review` — interactive approve / skip / delete. Approving appends the note to `.harness/memory/notes.md`; delete discards it; skip leaves it pending.
+- `harness memory --workspace <path>` — operate on another working folder.
+
+Approved notes in `.harness/memory/notes.md` are added to the agent's `memory` on every future run. The `.harness/` tree is gitignored, so this memory stays local.
+
+### Server mode
+
+In server mode the inbox lives host-side at `<server-cwd>/.harness/memory/inbox/` — outside every user's workspace. Approved notes are copied into each user's workspace on their next agent build (copy-on-build, like `CLAUDE.md`/`AGENTS.md`); only `notes.md` is synced, never the inbox. Notes approved after a user's agent is already built won't reach that user until the server restarts or the agent is rebuilt.
 
 ## Server mode (multi-user web API)
 
@@ -151,6 +179,7 @@ All endpoints require `Authorization: Bearer harn_...`:
 - `GET /v1/sessions/{id}/history` — message history for a session.
 - `POST /v1/sessions/{id}/messages` — send a message, stream the response via SSE.
 - `POST /v1/sessions/{id}/compact` — stream the compact flow via SSE.
+- `POST /v1/sessions/{id}/summarize` — summarize the session and queue it for memory review.
 - `DELETE /v1/sessions/{id}` — delete a session.
 
 Sessions in another user's database return `404` naturally — there is no ownership-filtering logic to get wrong.
@@ -175,6 +204,7 @@ Skills (`.claude/skills`) and memory files (`CLAUDE.md`, `AGENTS.md`) are read t
 
 - `.claude/skills` → `<user-workspace>/.claude/skills`
 - `CLAUDE.md` / `AGENTS.md` → `<user-workspace>/`
+- `.harness/memory/notes.md` → `<user-workspace>/.harness/memory/notes.md` (approved notes only; the inbox is never copied)
 
 Agent definition files (`.claude/agents/*.md`) and `mcp.json` are parsed host-side, so they stay shared without copying.
 
@@ -203,6 +233,7 @@ Tokens are `harn_` + 32 bytes of URL-safe randomness, stored as SHA-256 hashes i
 - **Harness profiles:** The underlying `deepagents` package supports harness profiles. This MVP does not expose profile selection; it builds a single default agent.
 - **Compaction is model-mediated:** `/compact` sends a normal turn and relies on the model to call the `compact_conversation` tool. If the conversation is below the configured trigger threshold the tool refuses and only the refusal text is shown; no summarization happens.
 - **Session storage grows unboundedly:** `.harness/sessions.db` accumulates one row per conversation. Prune old rows manually or with a separate job for now.
+- **Session memory grows unboundedly:** `.harness/memory/notes.md` accumulates one section per approved note. Trim it manually when it gets long.
 - **Conversation offloads:** deepagents may write large conversation summaries to `<cwd>/conversation_history/<session>.md` and `<cwd>/large_tool_results/`. These directories appear in the current working directory, or in the workspace folder when `--workspace` is set.
 - **Server-mode MCP is shared:** MCP servers configured in `mcp.json` are loaded once and shared across all users. They are outside the per-user privacy boundary.
 

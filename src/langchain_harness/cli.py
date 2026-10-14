@@ -11,8 +11,10 @@ from uuid import uuid4
 import typer
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from rich.console import Console
+from rich.markup import escape
 
-from langchain_harness.agent_builder import build_agent
+from langchain_harness import memory
+from langchain_harness.agent_builder import build_agent, build_model
 from langchain_harness.config import resolve_config
 from langchain_harness.runner import repl, run_once
 from langchain_harness import sessions
@@ -110,12 +112,28 @@ def run(
                 thread_id = uuid4().hex
 
             async with AsyncSqliteSaver.from_conn_string(str(db)) as checkpointer:
-                agent = await build_agent(config, root, checkpointer=checkpointer)
+                model = build_model(config)
+                agent = await build_agent(
+                    config, root, checkpointer=checkpointer, model=model
+                )
                 user_prompt = prompt_arg if prompt is None else prompt
                 if user_prompt is not None:
-                    await run_once(agent, user_prompt, thread_id, db_conn=db_conn)
+                    await run_once(
+                        agent,
+                        user_prompt,
+                        thread_id,
+                        db_conn=db_conn,
+                        model=model,
+                        memory_root=root,
+                    )
                 else:
-                    await repl(agent, thread_id, db_conn=db_conn)
+                    await repl(
+                        agent,
+                        thread_id,
+                        db_conn=db_conn,
+                        model=model,
+                        memory_root=root,
+                    )
 
     asyncio.run(_run())
 
@@ -151,6 +169,64 @@ def list_sessions(
                 )
 
     asyncio.run(_list())
+
+
+@app.command(name="memory")
+def memory_command(
+    review: bool = typer.Option(False, "--review", help="Interactively review pending notes."),
+    workspace: str | None = typer.Option(
+        None,
+        "--workspace",
+        help="Working folder for the memory store. A relative path resolves against the current directory; ~ expands.",
+    ),
+) -> None:
+    """List or review queued session-memory notes."""
+    _setup_logging()
+    root = _resolve_root(workspace)
+    console = Console()
+    notes = memory.list_inbox(root)
+
+    if not review:
+        if not notes:
+            console.print("No pending notes.")
+            return
+        for note in notes:
+            preview = note.summary.splitlines()[0] if note.summary else ""
+            console.print(
+                f"{escape(note.note_id)}  {escape(note.created_at)}  "
+                f"{escape(note.title)}  {escape(preview)}"
+            )
+        return
+
+    if not notes:
+        console.print("No pending notes.")
+        return
+
+    for note in notes:
+        console.print(
+            f"\n[bold]{escape(note.note_id)}[/bold]  {escape(note.title)}  "
+            f"[dim]({escape(note.created_at)})[/dim]"
+        )
+        console.print(escape(note.summary))
+        try:
+            choice = console.input(
+                escape("[a]pprove / [s]kip / [d]elete / [q]uit: ")
+            ).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            console.print("\nStopped.")
+            return
+
+        if choice.startswith("q"):
+            break
+        if choice.startswith("a"):
+            if memory.approve_note(root, note.note_id):
+                console.print("[green]Approved.[/green]")
+            continue
+        if choice.startswith("d"):
+            if memory.reject_note(root, note.note_id):
+                console.print("[yellow]Deleted.[/yellow]")
+            continue
+        console.print("[dim]Skipped.[/dim]")
 
 
 # ---------------------------------------------------------------------------
@@ -283,7 +359,7 @@ def users_revoke(
 # dispatch
 # ---------------------------------------------------------------------------
 
-_KNOWN_SUBCOMMANDS = {"run", "sessions", "serve", "users"}
+_KNOWN_SUBCOMMANDS = {"run", "sessions", "serve", "users", "memory"}
 
 # keep in sync with value-taking typer.Option declarations above
 _OPTIONS_WITH_VALUE = {

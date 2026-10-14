@@ -10,6 +10,7 @@ import pytest
 
 from langchain_harness.api.app import create_app
 from langchain_harness.config import Config
+from langchain_harness.memory import inbox_dir, list_inbox
 from langchain_harness.serverdb import add_user, hash_token, init_server_db, server_db_path
 
 
@@ -52,14 +53,34 @@ class _FakeAgent:
 class _FakeAgentCache:
     """Minimal cache that returns a fake agent without building anything."""
 
-    def __init__(self, agent: Any) -> None:
+    def __init__(self, agent: Any, shared_model: Any | None = None) -> None:
         self._agent = agent
+        self.shared_model = shared_model
 
     async def get_agent(self, user_id: str) -> Any:
         return self._agent
 
     async def close_all(self) -> None:
         pass
+
+
+class _FakeSummarizingModel:
+    """Fake shared model used by the summarize endpoint."""
+
+    def __init__(self, content: str = "- summary bullet") -> None:
+        self.content = content
+        self.calls = 0
+
+    async def ainvoke(self, messages: list[Any]) -> Any:
+        self.calls += 1
+        return type("Result", (), {"content": self.content})()
+
+
+class _FailingSummarizingModel:
+    """Shared model whose summarization call always raises."""
+
+    async def ainvoke(self, messages: list[Any]) -> Any:
+        raise RuntimeError("model down")
 
 
 class _FakeCheckpointer:
@@ -105,6 +126,7 @@ async def test_env(tmp_path, monkeypatch):
     # We need to manage the lifespan manually
     async with app.router.lifespan_context(app):
         app.state.get_agent = fake_cache.get_agent
+        app.state.agent_cache = fake_cache
 
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -299,6 +321,7 @@ async def test_delete_session_calls_checkpointer_adelete_thread(tmp_path, monkey
 
     async with app.router.lifespan_context(app):
         app.state.get_agent = fake_cache.get_agent
+        app.state.agent_cache = fake_cache
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
             # Create a session
@@ -458,6 +481,7 @@ async def test_history_returns_messages_after_send(tmp_path, monkeypatch) -> Non
 
     async with app.router.lifespan_context(app):
         app.state.get_agent = fake_cache.get_agent
+        app.state.agent_cache = fake_cache
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
             resp = await client.post(
@@ -516,6 +540,7 @@ async def test_smoke_isolation_two_users(tmp_path, monkeypatch):
 
     async with app.router.lifespan_context(app):
         app.state.get_agent = fake_cache.get_agent
+        app.state.agent_cache = fake_cache
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
             # Alice creates 3 sessions
@@ -547,3 +572,199 @@ async def test_smoke_isolation_two_users(tmp_path, monkeypatch):
             )
             assert resp.status_code == 200
             assert len(resp.json()) == 1
+
+
+# --- session memory ---
+
+
+async def _make_app_env(tmp_path, monkeypatch, *, agent, shared_model):
+    """Create an app whose per-user agent and shared model are fakes."""
+    monkeypatch.chdir(tmp_path)
+
+    import aiosqlite
+
+    db_path = server_db_path(tmp_path)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    async with aiosqlite.connect(str(db_path)) as conn:
+        await init_server_db(conn)
+        token = await add_user(conn, "alice")
+
+    config = Config(provider="anthropic", model="test-model")
+    app = create_app(tmp_path, config)
+    cache = _FakeAgentCache(agent, shared_model=shared_model)
+    return app, cache, token
+
+
+@pytest.mark.asyncio
+async def test_summarize_endpoint_queues_note(tmp_path, monkeypatch) -> None:
+    agent = _FakeAgent(
+        state_messages=[_FakeMsg("human", "hi"), _FakeMsg("ai", "hello")]
+    )
+    model = _FakeSummarizingModel("- summary bullet")
+    app, cache, token = await _make_app_env(
+        tmp_path, monkeypatch, agent=agent, shared_model=model
+    )
+
+    async with app.router.lifespan_context(app):
+        app.state.get_agent = cache.get_agent
+        app.state.agent_cache = cache
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post(
+                "/v1/sessions",
+                json={"title": "memory session"},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            session_id = resp.json()["session_id"]
+
+            resp = await client.post(
+                f"/v1/sessions/{session_id}/summarize",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "queued"
+
+    notes = list_inbox(tmp_path)
+    assert len(notes) == 1
+    assert notes[0].thread_id == session_id
+    assert notes[0].note_id == body["note_id"]
+    assert notes[0].note_id.endswith(f"--{session_id}")
+    assert notes[0].title == "memory session"
+    assert notes[0].summary == "- summary bullet"
+    assert notes[0].user_id is not None
+    # Pending until a human approves it.
+    assert not (tmp_path / ".harness" / "memory" / "notes.md").exists()
+
+
+@pytest.mark.asyncio
+async def test_summarize_endpoint_skips_without_shared_model(test_env) -> None:
+    resp = await test_env["client"].post(
+        "/v1/sessions",
+        json={"title": "no model"},
+        headers={"Authorization": f"Bearer {test_env['token_a']}"},
+    )
+    session_id = resp.json()["session_id"]
+
+    resp = await test_env["client"].post(
+        f"/v1/sessions/{session_id}/summarize",
+        headers={"Authorization": f"Bearer {test_env['token_a']}"},
+    )
+
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "skipped", "reason": "no model available"}
+    assert list_inbox(test_env["tmp_path"]) == []
+
+
+@pytest.mark.asyncio
+async def test_summarize_endpoint_skips_without_substantive_content(
+    tmp_path, monkeypatch
+) -> None:
+    agent = _FakeAgent()
+    model = _FakeSummarizingModel()
+    app, cache, token = await _make_app_env(
+        tmp_path, monkeypatch, agent=agent, shared_model=model
+    )
+
+    async with app.router.lifespan_context(app):
+        app.state.get_agent = cache.get_agent
+        app.state.agent_cache = cache
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post(
+                "/v1/sessions",
+                json={"title": "empty"},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            session_id = resp.json()["session_id"]
+
+            resp = await client.post(
+                f"/v1/sessions/{session_id}/summarize",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "skipped", "reason": "not captured"}
+    assert model.calls == 0
+    assert list_inbox(tmp_path) == []
+
+
+@pytest.mark.asyncio
+async def test_summarize_endpoint_skips_when_model_raises(tmp_path, monkeypatch) -> None:
+    agent = _FakeAgent(
+        state_messages=[_FakeMsg("human", "hi"), _FakeMsg("ai", "hello")]
+    )
+    app, cache, token = await _make_app_env(
+        tmp_path, monkeypatch, agent=agent, shared_model=_FailingSummarizingModel()
+    )
+
+    async with app.router.lifespan_context(app):
+        app.state.get_agent = cache.get_agent
+        app.state.agent_cache = cache
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post(
+                "/v1/sessions",
+                json={"title": "boom"},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            session_id = resp.json()["session_id"]
+
+            resp = await client.post(
+                f"/v1/sessions/{session_id}/summarize",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "skipped", "reason": "not captured"}
+    assert list_inbox(tmp_path) == []
+
+
+@pytest.mark.asyncio
+async def test_summarize_endpoint_404_on_foreign_session(test_env) -> None:
+    resp = await test_env["client"].post(
+        "/v1/sessions",
+        json={"title": "alice's"},
+        headers={"Authorization": f"Bearer {test_env['token_a']}"},
+    )
+    session_id = resp.json()["session_id"]
+
+    resp = await test_env["client"].post(
+        f"/v1/sessions/{session_id}/summarize",
+        headers={"Authorization": f"Bearer {test_env['token_b']}"},
+    )
+    assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_delete_session_does_not_write_memory_note(tmp_path, monkeypatch) -> None:
+    agent = _FakeAgent(
+        state_messages=[_FakeMsg("human", "hi"), _FakeMsg("ai", "hello")]
+    )
+    model = _FakeSummarizingModel()
+    app, cache, token = await _make_app_env(
+        tmp_path, monkeypatch, agent=agent, shared_model=model
+    )
+
+    async with app.router.lifespan_context(app):
+        app.state.get_agent = cache.get_agent
+        app.state.agent_cache = cache
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post(
+                "/v1/sessions",
+                json={"title": "to delete"},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            session_id = resp.json()["session_id"]
+
+            resp = await client.delete(
+                f"/v1/sessions/{session_id}",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+    assert resp.status_code == 200
+    assert model.calls == 0
+    assert not inbox_dir(tmp_path).exists()
+    assert not (tmp_path / ".harness" / "memory" / "notes.md").exists()

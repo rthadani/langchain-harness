@@ -5,11 +5,11 @@ import pytest
 
 from langchain_harness.agent_builder import (
     _MCP_TOOLS_TIMEOUT,
-    _build_model,
     _build_summarization_middleware,
     _load_subagents,
     _resolve_subagent_model,
     build_agent,
+    build_model,
 )
 from langchain_harness.config import CompactionConfig, Config
 
@@ -118,16 +118,16 @@ def test_build_model_kwargs_matrix(monkeypatch) -> None:
 
     monkeypatch.setattr("langchain_harness.agent_builder.init_chat_model", fake_init)
 
-    _build_model(Config(provider="anthropic", model="claude-3"))
+    build_model(Config(provider="anthropic", model="claude-3"))
     assert calls[-1] == ("claude-3", {"model_provider": "anthropic"})
 
-    _build_model(Config(provider="openai", model="gpt-4", base_url="http://x"))
+    build_model(Config(provider="openai", model="gpt-4", base_url="http://x"))
     assert calls[-1] == ("gpt-4", {"model_provider": "openai", "base_url": "http://x"})
 
-    _build_model(Config(provider="openai", model="gpt-4", api_key="k"))
+    build_model(Config(provider="openai", model="gpt-4", api_key="k"))
     assert calls[-1] == ("gpt-4", {"model_provider": "openai", "api_key": "k"})
 
-    _build_model(Config(provider="openai", model="gpt-4", base_url="http://x", api_key="k"))
+    build_model(Config(provider="openai", model="gpt-4", base_url="http://x", api_key="k"))
     assert calls[-1] == (
         "gpt-4",
         {"model_provider": "openai", "base_url": "http://x", "api_key": "k"},
@@ -307,7 +307,7 @@ def test_build_summarization_middleware_returns_none_when_no_trigger() -> None:
 async def test_build_agent_override_skips_model_backend_tools_discovery(
     tmp_path: Path, monkeypatch
 ) -> None:
-    """When all overrides are provided, _build_model, _build_backend, MCP
+    """When all overrides are provided, build_model, _build_backend, MCP
     loading, and discover_all are all skipped."""
     captured: dict[str, Any] = {}
 

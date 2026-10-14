@@ -20,8 +20,16 @@ def discover_agents(root: Path) -> list[Path]:
 
 
 def discover_memory(root: Path) -> list[Path]:
-    """Return existing AGENTS.md / CLAUDE.md memory files in precedence order."""
-    candidates = [root / "CLAUDE.md", root / "AGENTS.md"]
+    """Return existing memory files in precedence order.
+
+    Project instructions come first, then the approved session notes written by
+    ``harness memory``.
+    """
+    candidates = [
+        root / "CLAUDE.md",
+        root / "AGENTS.md",
+        root / ".harness" / "memory" / "notes.md",
+    ]
     return [p for p in candidates if p.is_file()]
 
 

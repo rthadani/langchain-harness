@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from typing import Any, Callable
 
 import aiosqlite
@@ -12,6 +13,7 @@ from rich.text import Text
 
 from langchain_harness import sessions
 from langchain_harness.events import COMPACT_PROMPT, stream_turn_events
+from langchain_harness.memory import capture_session_note
 
 
 def _render_tool_call(console: Console, name: str, input_data: Any) -> None:
@@ -66,8 +68,15 @@ async def run_once(
     *,
     console: Console | None = None,
     db_conn: aiosqlite.Connection | None = None,
+    model: Any | None = None,
+    memory_root: Path | None = None,
 ) -> None:
-    """Run a single user prompt and stream the result."""
+    """Run a single user prompt and stream the result.
+
+    When *model* and *memory_root* are provided, the finished session is
+    summarized into the memory review inbox — a one-shot run is headless, so
+    there is no chance for the user to ask for it later.
+    """
     if console is None:
         console = Console()
     try:
@@ -79,6 +88,9 @@ async def run_once(
             console.print(f"[red]Error:[/red] {escape(str(exc))}")
     finally:
         await _upsert_session(db_conn, thread_id, title=prompt)
+        # Capture memory before anything else can clear the session state.
+        if model is not None and memory_root is not None:
+            await capture_session_note(model, agent, thread_id, memory_root, title=prompt)
 
 
 async def _list_sessions_command(
@@ -160,12 +172,38 @@ async def _compact_command(
     await _upsert_session(db_conn, thread_id, title="/compact")
 
 
+async def _summarize_command(
+    agent: Any,
+    thread_id: str,
+    console: Console,
+    model: Any | None,
+    memory_root: Path | None,
+    title: str,
+) -> None:
+    """Queue a durable memory note for the current session."""
+    if model is None or memory_root is None:
+        console.print("[red]Error:[/red] summarization is not available")
+        return
+    note = await capture_session_note(
+        model, agent, thread_id, memory_root, title=title
+    )
+    if note is None:
+        console.print("Nothing to summarize.")
+    else:
+        console.print(
+            f"[green]Queued memory note[/green] {escape(note.stem)} "
+            "— review it with [bold]harness memory --review[/bold]."
+        )
+
+
 async def repl(
     agent: Any,
     thread_id: str,
     *,
     console: Console | None = None,
     db_conn: aiosqlite.Connection | None = None,
+    model: Any | None = None,
+    memory_root: Path | None = None,
 ) -> None:
     """Run an interactive multi-turn REPL."""
     if console is None:
@@ -173,8 +211,10 @@ async def repl(
     console.print(
         "[bold green]harness[/bold green] interactive mode. "
         "Type /exit or press Ctrl-D to quit. "
-        "Commands: /sessions, /resume <id>, /compact."
+        "Commands: /sessions, /resume <id>, /compact, /summarize."
     )
+
+    first_prompt: str | None = None
 
     while True:
         try:
@@ -202,6 +242,19 @@ async def repl(
         if lower == "/compact":
             await _compact_command(agent, thread_id, console, db_conn)
             continue
+        if lower == "/summarize":
+            await _summarize_command(
+                agent,
+                thread_id,
+                console,
+                model,
+                memory_root,
+                first_prompt or "REPL session",
+            )
+            continue
+
+        if first_prompt is None:
+            first_prompt = prompt
 
         try:
             await _stream_turn(agent, prompt, thread_id, console)

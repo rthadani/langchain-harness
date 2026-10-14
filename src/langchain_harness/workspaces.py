@@ -79,6 +79,15 @@ def _sync_shared_config(cwd: Path, workspace: Path) -> None:
             shutil.copy2(src, dst)
             logger.info("Synced %s to %s", name, dst)
 
+    # Approved session notes only — the pending inbox stays host-side so
+    # unapproved summaries never reach an agent.
+    src_notes = cwd / ".harness" / "memory" / "notes.md"
+    if src_notes.is_file():
+        dst_notes = workspace / ".harness" / "memory" / "notes.md"
+        dst_notes.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src_notes, dst_notes)
+        logger.info("Synced memory notes to %s", dst_notes)
+
 
 def get_workspace_skills_dir(workspace: Path) -> Path | None:
     """Return the in-workspace skills directory if it exists."""
@@ -88,5 +97,9 @@ def get_workspace_skills_dir(workspace: Path) -> Path | None:
 
 def get_workspace_memory_paths(workspace: Path) -> list[Path]:
     """Return in-workspace memory files that exist."""
-    candidates = [workspace / "CLAUDE.md", workspace / "AGENTS.md"]
+    candidates = [
+        workspace / "CLAUDE.md",
+        workspace / "AGENTS.md",
+        workspace / ".harness" / "memory" / "notes.md",
+    ]
     return [p for p in candidates if p.is_file()]
