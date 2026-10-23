@@ -20,17 +20,10 @@ from langchain_harness.api.schemas import (
 from langchain_harness.api.sse import stream_sse_response
 from langchain_harness.events import COMPACT_PROMPT
 from langchain_harness.memory import capture_session_note
-from langchain_harness.sessions import connect, upsert
-from langchain_harness import sessions as sessions_module
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/v1/sessions", tags=["sessions"])
-
-
-def _user_db_path(request: Request, user_id: str):
-    from langchain_harness.workspaces import user_sessions_db
-    return user_sessions_db(request.app.state.cwd, user_id)
 
 
 @router.post("", response_model=SessionResponse)
@@ -43,18 +36,14 @@ async def create_session(
     """Create a new session for the authenticated user."""
     user_id = user["user_id"]
     thread_id = uuid4().hex
-    db_path = _user_db_path(request, user_id)
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    async with connect(db_path) as conn:
-        await upsert(conn, thread_id, title=body.title)
-        row = await sessions_module.list_sessions(conn)
-        # Find our session
-        session = next((r for r in row if r["thread_id"] == thread_id), None)
+    row = await request.app.state.db.create_session(
+        user_id, thread_id, body.title
+    )
 
     return SessionResponse(
         session_id=thread_id,
-        title=body.title,
-        created_at=session["created_at"] if session else "",
+        title=row["title"] or "",
+        created_at=row["created_at"],
     )
 
 
@@ -65,12 +54,7 @@ async def list_sessions(
     user: dict[str, Any] = Depends(get_current_user),
 ) -> list[SessionListItem]:
     """List the authenticated user's sessions only."""
-    user_id = user["user_id"]
-    db_path = _user_db_path(request, user_id)
-    if not db_path.exists():
-        return []
-    async with connect(db_path) as conn:
-        rows = await sessions_module.list_sessions(conn)
+    rows = await request.app.state.db.list_sessions(user["user_id"])
     return [
         SessionListItem(
             session_id=r["thread_id"],
@@ -85,13 +69,8 @@ async def list_sessions(
 async def _resolve_session(
     request: Request, user: dict[str, Any], session_id: str
 ) -> dict[str, Any]:
-    """Return the session row if it exists in the user's db, else 404."""
-    user_id = user["user_id"]
-    db_path = _user_db_path(request, user_id)
-    if not db_path.exists():
-        raise HTTPException(status_code=404, detail="Session not found")
-    async with connect(db_path) as conn:
-        session = await sessions_module.get_session(conn, session_id)
+    """Return the session row if it belongs to the user, else 404."""
+    session = await request.app.state.db.get_session(user["user_id"], session_id)
     if session is None:
         raise HTTPException(status_code=404, detail="Session not found")
     return session
@@ -143,17 +122,24 @@ async def send_message(
     """Send a message and stream the agent's response as SSE."""
     row = await _resolve_session(request, user, session_id)
     thread_id = row["thread_id"]
-    agent = await request.app.state.get_agent(user["user_id"])
-
-    db_path = _user_db_path(request, user["user_id"])
+    user_id = user["user_id"]
+    agent = await request.app.state.get_agent(user_id)
 
     async def _stream():
         try:
             async for chunk in stream_sse_response(agent, body.content, thread_id, request):
                 yield chunk
         finally:
-            async with connect(db_path) as conn:
-                await upsert(conn, thread_id, title=body.content)
+            try:
+                await request.app.state.db.upsert_session(
+                    user_id, thread_id, body.content
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Failed to update session %s after streaming: %s",
+                    thread_id,
+                    exc,
+                )
 
     return StreamingResponse(
         _stream(),
@@ -171,8 +157,8 @@ async def compact_session(
     """Stream the /compact flow as SSE. 404 on foreign session."""
     row = await _resolve_session(request, user, session_id)
     thread_id = row["thread_id"]
-    agent = await request.app.state.get_agent(user["user_id"])
-    db_path = _user_db_path(request, user["user_id"])
+    user_id = user["user_id"]
+    agent = await request.app.state.get_agent(user_id)
 
     compact_prompt = getattr(request.app.state.config.prompts, "compact", None) or COMPACT_PROMPT
 
@@ -181,8 +167,14 @@ async def compact_session(
             async for chunk in stream_sse_response(agent, compact_prompt, thread_id, request):
                 yield chunk
         finally:
-            async with connect(db_path) as conn:
-                await upsert(conn, thread_id, title="/compact")
+            try:
+                await request.app.state.db.upsert_session(
+                    user_id, thread_id, "/compact"
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Failed to update session %s after compact: %s", thread_id, exc
+                )
 
     return StreamingResponse(
         _stream(),
@@ -231,7 +223,8 @@ async def delete_session(
     """Delete a session. 404 on foreign session."""
     row = await _resolve_session(request, user, session_id)
     thread_id = row["thread_id"]
-    agent = await request.app.state.get_agent(user["user_id"])
+    user_id = user["user_id"]
+    agent = await request.app.state.get_agent(user_id)
 
     # Delete checkpoint data via the saver, then the sessions metadata row
     try:
@@ -239,9 +232,5 @@ async def delete_session(
     except Exception as exc:  # noqa: BLE001
         logger.warning("Failed to delete checkpoint data for session %s: %s", thread_id, exc)
 
-    db_path = _user_db_path(request, user["user_id"])
-    async with connect(db_path) as conn:
-        await conn.execute("DELETE FROM sessions WHERE thread_id = ?", (thread_id,))
-        await conn.commit()
-
+    await request.app.state.db.delete_session(user_id, thread_id)
     return {"status": "deleted"}
