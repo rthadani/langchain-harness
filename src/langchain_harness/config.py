@@ -43,6 +43,37 @@ class CompactionConfig:
     keep_messages: int = 20
 
 
+# Auth modes the server knows how to build. Order in ``auth_modes`` is the
+# order they are tried; the first one holding a credential for the request wins.
+KNOWN_AUTH_MODES = ("token", "trust", "jwt")
+
+# Asymmetric JWT algorithms only. HMAC (HS*) and 'none' are forbidden because
+# the verifier uses the issuer's public JWKS: an attacker who can ask for a
+# token signed with a shared secret would be able to forge tokens.
+ALLOWED_JWT_ALGORITHMS = frozenset(
+    {"RS256", "RS384", "RS512", "ES256", "ES384", "ES512", "PS256", "PS384", "PS512", "EdDSA"}
+)
+
+
+@dataclass(frozen=True)
+class JwtConfig:
+    """OIDC/JWT verification settings used when ``jwt`` is an auth mode.
+
+    Signing keys come from the issuer's JWKS, discovered through
+    ``<issuer>/.well-known/openid-configuration`` unless ``jwks_url`` overrides
+    it. Only asymmetric algorithms are supported, so there is no shared secret
+    to leak or rotate by hand.
+    """
+
+    issuer: str | None = None
+    audience: str | None = None
+    user_claim: str = "sub"
+    algorithms: tuple[str, ...] = ("RS256", "ES256", "PS256")
+    jwks_url: str | None = None
+    clock_skew_seconds: int = 60
+    discovery_timeout_seconds: float = 5.0
+
+
 @dataclass(frozen=True)
 class ServerConfig:
     """Configuration for the multi-user web API server."""
@@ -50,6 +81,9 @@ class ServerConfig:
     host: str = "127.0.0.1"
     port: int = 8000
     enable_shell: bool = False
+    auth_modes: tuple[str, ...] = ("token",)
+    jwt: JwtConfig = field(default_factory=JwtConfig)
+    max_auto_provisioned_users: int = 500
 
 
 @dataclass(frozen=True)
@@ -165,6 +199,150 @@ def _api_key_fallback(provider: str) -> str | None:
     return None
 
 
+def _split_list(value: Any) -> tuple[str, ...] | None:
+    """Parse a list (TOML array or comma-separated string)."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        items = value.split(",")
+    elif isinstance(value, list | tuple):
+        items = [str(item) for item in value]
+    else:
+        return None
+    items = tuple(item.strip() for item in items if item.strip())
+    return items or None
+
+
+def _parse_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 0 else None
+
+
+def _parse_max_auto_provisioned(value: Any) -> int | None:
+    """Parse max_auto_provisioned_users; any integer is valid (<=0 is unlimited)."""
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _resolve_jwt(toml_data: dict[str, Any]) -> JwtConfig:
+    """Build a ``JwtConfig`` from the ``[server.jwt]`` TOML section."""
+    server_section = toml_data.get("server", {})
+    if not isinstance(server_section, dict):
+        server_section = {}
+    section = server_section.get("jwt", {})
+    if not isinstance(section, dict):
+        section = {}
+
+    defaults = JwtConfig()
+    clock_skew = _parse_int(
+        os.environ.get("HARNESS_SERVER_JWT_CLOCK_SKEW_SECONDS")
+        or section.get("clock_skew_seconds")
+    )
+    algorithms_raw = _split_list(
+        os.environ.get("HARNESS_SERVER_JWT_ALGORITHMS") or section.get("algorithms")
+    )
+    algorithms = (
+        tuple(algo.upper() for algo in algorithms_raw)
+        if algorithms_raw
+        else defaults.algorithms
+    )
+    bad_algorithms = [algo for algo in algorithms if algo not in ALLOWED_JWT_ALGORITHMS]
+    if bad_algorithms:
+        print(
+            f"Error: [server.jwt] algorithms contains {bad_algorithms[0]!r}, "
+            "which is not an allowed algorithm. Only asymmetric algorithms are "
+            f"permitted: {', '.join(sorted(ALLOWED_JWT_ALGORITHMS))}. "
+            "HMAC (HS*) and 'none' are never allowed.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
+    discovery_timeout = _parse_float(
+        os.environ.get("HARNESS_SERVER_JWT_DISCOVERY_TIMEOUT_SECONDS")
+        or section.get("discovery_timeout_seconds")
+    )
+
+    return JwtConfig(
+        issuer=os.environ.get("HARNESS_SERVER_JWT_ISSUER")
+        or section.get("issuer")
+        or defaults.issuer,
+        audience=os.environ.get("HARNESS_SERVER_JWT_AUDIENCE")
+        or section.get("audience")
+        or defaults.audience,
+        user_claim=os.environ.get("HARNESS_SERVER_JWT_USER_CLAIM")
+        or section.get("user_claim")
+        or defaults.user_claim,
+        algorithms=algorithms,
+        jwks_url=os.environ.get("HARNESS_SERVER_JWT_JWKS_URL")
+        or section.get("jwks_url")
+        or defaults.jwks_url,
+        clock_skew_seconds=defaults.clock_skew_seconds if clock_skew is None else clock_skew,
+        discovery_timeout_seconds=defaults.discovery_timeout_seconds
+        if discovery_timeout is None
+        else discovery_timeout,
+    )
+
+
+def _resolve_auth_modes(toml_data: dict[str, Any]) -> tuple[tuple[str, ...], JwtConfig]:
+    """Resolve ``[server] auth_modes`` and validate the combination.
+
+    Returns the validated modes and the ``JwtConfig`` resolved from the same
+    TOML section so the caller does not resolve it twice.
+
+    Raises ``SystemExit`` for an unknown mode, or for ``jwt`` without the
+    required ``issuer`` and ``audience``: deployment mistakes that would
+    otherwise surface as 401s.
+    """
+    server_section = toml_data.get("server", {})
+    if not isinstance(server_section, dict):
+        server_section = {}
+
+    modes_raw = _split_list(
+        os.environ.get("HARNESS_SERVER_AUTH_MODES")
+        or server_section.get("auth_modes")
+    )
+    modes = tuple(mode.lower() for mode in modes_raw) if modes_raw else ("token",)
+
+    unknown = [mode for mode in modes if mode not in KNOWN_AUTH_MODES]
+    if unknown:
+        print(
+            f"Error: unknown [server] auth_modes entry {unknown[0]!r}. "
+            f"Known modes: {', '.join(KNOWN_AUTH_MODES)}.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
+    if len(set(modes)) != len(modes):
+        print("Error: [server] auth_modes contains duplicates.", file=sys.stderr)
+        raise SystemExit(1)
+
+    jwt = _resolve_jwt(toml_data)
+    if "jwt" in modes:
+        missing = []
+        if not jwt.issuer:
+            missing.append("issuer")
+        if not jwt.audience:
+            missing.append("audience")
+        if missing:
+            print(
+                f"Error: [server] auth_modes includes 'jwt' but [server.jwt] "
+                f"is missing required key(s): {', '.join(missing)}.",
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
+
+    return modes, jwt
+
+
 def _resolve_server(toml_data: dict[str, Any]) -> ServerConfig:
     """Build a ``ServerConfig`` from [server] TOML and env vars."""
     toml_section = toml_data.get("server", {})
@@ -185,7 +363,28 @@ def _resolve_server(toml_data: dict[str, Any]) -> ServerConfig:
     else:
         enable_shell = bool(toml_section.get("enable_shell", False))
 
-    return ServerConfig(host=host, port=port, enable_shell=enable_shell)
+    auth_modes, jwt = _resolve_auth_modes(toml_data)
+
+    max_auto_env = _parse_max_auto_provisioned(
+        os.environ.get("HARNESS_SERVER_MAX_AUTO_PROVISIONED_USERS")
+    )
+    max_auto_toml = _parse_max_auto_provisioned(
+        toml_section.get("max_auto_provisioned_users")
+    )
+    max_auto_provisioned_users = (
+        max_auto_env
+        if max_auto_env is not None
+        else (max_auto_toml if max_auto_toml is not None else 500)
+    )
+
+    return ServerConfig(
+        host=host,
+        port=port,
+        enable_shell=enable_shell,
+        auth_modes=auth_modes,
+        jwt=jwt,
+        max_auto_provisioned_users=max_auto_provisioned_users,
+    )
 
 
 def resolve_config(

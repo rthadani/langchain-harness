@@ -4,40 +4,41 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-import aiosqlite
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 
 from langchain_harness.agent_builder import _build_backend, build_agent, build_model
 from langchain_harness.config import Config
 from langchain_harness.mcp_loader import load_mcp_connections
+from langchain_harness.api.auth import build_auth
 from langchain_harness.api.routes_sessions import router as sessions_router
-from langchain_harness.serverdb import init_server_db, server_db_path
+from langchain_harness.store import Store, make_store
 from langchain_harness.workspaces import (
     get_workspace_memory_paths,
     get_workspace_skills_dir,
     provision_user_workspace,
-    user_sessions_db,
 )
 
 logger = logging.getLogger(__name__)
 
 
 class UserAgentCache:
-    """Manages per-user agent instances, savers, and MCP exit stacks."""
+    """Manages per-user agent instances and checkpointer lifetimes."""
 
-    def __init__(self, cwd: Path, config: Config) -> None:
+    def __init__(self, cwd: Path, config: Config, store: Store) -> None:
         self.cwd = cwd
         self.config = config
-        self._cache: dict[str, tuple[Any, Any]] = {}  # user_id → (agent, saver_ctx)
+        self.store = store
+        self._cache: dict[str, Any] = {}  # user_id → agent
+        self._stacks: dict[str, AsyncExitStack] = {}  # user_id → checkpointer scope
         self._locks: dict[str, asyncio.Lock] = {}
         self._global_lock = asyncio.Lock()
         self.shared_model: Any = None
         self.shared_mcp_tools: list[Any] = []
-        self._saver_contexts: dict[str, Any] = {}  # user_id → AsyncSqliteSaver context
 
     async def initialize_shared(self) -> None:
         """Build the shared model and load MCP tools once at startup."""
@@ -68,24 +69,15 @@ class UserAgentCache:
 
         async with self._locks[user_id]:
             if user_id in self._cache:
-                return self._cache[user_id][0]
+                return self._cache[user_id]
 
             agent = await self._build_user_agent(user_id)
-            self._cache[user_id] = (agent, None)
+            self._cache[user_id] = agent
             return agent
 
     async def _build_user_agent(self, user_id: str) -> Any:
-        """Build a deep agent for a specific user with their own workspace/saver."""
-        from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
-
+        """Build a deep agent for a specific user with their own workspace."""
         workspace = provision_user_workspace(self.cwd, user_id)
-        db_path = user_sessions_db(self.cwd, user_id)
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-
-        # Open the AsyncSqliteSaver as an async context manager
-        saver_ctx = AsyncSqliteSaver.from_conn_string(str(db_path))
-        saver = await saver_ctx.__aenter__()
-        self._saver_contexts[user_id] = saver_ctx
 
         enable_shell = self.config.server.enable_shell
         if enable_shell:
@@ -106,11 +98,15 @@ class UserAgentCache:
         memory_paths = get_workspace_memory_paths(workspace)
         memory_override = [str(p) for p in memory_paths]
 
+        stack = AsyncExitStack()
         try:
-            return await build_agent(
+            checkpointer = await stack.enter_async_context(
+                self.store.checkpointer(user_id)
+            )
+            agent = await build_agent(
                 self.config,
                 self.cwd,
-                checkpointer=saver,
+                checkpointer=checkpointer,
                 enable_shell=enable_shell,
                 root_dir=workspace,
                 skills_override=skills_override,
@@ -119,43 +115,49 @@ class UserAgentCache:
                 tools_override=self.shared_mcp_tools,
                 backend=backend,
             )
-        except Exception as exc:  # noqa: BLE001
-            await saver_ctx.__aexit__(type(exc), exc, exc.__traceback__)
-            del self._saver_contexts[user_id]
+        except Exception:
+            await stack.aclose()
             raise
 
+        self._stacks[user_id] = stack
+        return agent
+
     async def close_all(self) -> None:
-        """Close all savers on shutdown."""
-        for user_id, saver_ctx in list(self._saver_contexts.items()):
+        """Close every per-user checkpointer scope on shutdown."""
+        for user_id, stack in list(self._stacks.items()):
             try:
-                await saver_ctx.__aexit__(None, None, None)
+                await stack.aclose()
             except Exception as exc:  # noqa: BLE001
-                logger.warning("Error closing saver for user %s: %s", user_id, exc)
-        self._saver_contexts.clear()
+                logger.warning("Error closing checkpointer for user %s: %s", user_id, exc)
+        self._stacks.clear()
         self._cache.clear()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Lifespan: init shared model+MCP, init server.db, close on shutdown."""
+    """Lifespan: open the store, init shared model+MCP, close on shutdown."""
     cwd = app.state.cwd
     config = app.state.config
 
-    # Ensure server.db exists
-    db_path = server_db_path(cwd)
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    async with aiosqlite.connect(str(db_path)) as conn:
-        await init_server_db(conn)
+    store = make_store(cwd)
+    await store.initialize()
+    app.state.db = store
 
-    # Build the per-user agent cache
-    cache = UserAgentCache(cwd, config)
+    cache = UserAgentCache(cwd, config, store)
     await cache.initialize_shared()
     app.state.agent_cache = cache
     app.state.get_agent = cache.get_agent
 
-    yield
+    app.state.auth = build_auth(config.server, store)
+    logger.info(
+        "Auth modes (in precedence order): %s", ", ".join(app.state.auth.modes)
+    )
 
-    await cache.close_all()
+    try:
+        yield
+    finally:
+        await cache.close_all()
+        await store.close()
 
 
 def create_app(cwd: Path, config: Config) -> FastAPI:
@@ -163,5 +165,27 @@ def create_app(cwd: Path, config: Config) -> FastAPI:
     app = FastAPI(title="langchain-harness", lifespan=lifespan)
     app.state.cwd = cwd
     app.state.config = config
+
+    @app.get("/healthz", include_in_schema=False)
+    async def healthz() -> dict[str, str]:
+        """Liveness: the process is up and serving HTTP."""
+        return {"status": "ok"}
+
+    @app.get("/readyz", include_in_schema=False)
+    async def readyz(request: Request) -> JSONResponse:
+        """Readiness: startup finished and the state store is reachable."""
+        store = getattr(request.app.state, "db", None)
+        ready = False
+        if store is not None:
+            try:
+                await store.ping()
+                ready = True
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Readiness check failed: %s", exc)
+        return JSONResponse(
+            {"status": "ready" if ready else "starting"},
+            status_code=200 if ready else 503,
+        )
+
     app.include_router(sessions_router)
     return app

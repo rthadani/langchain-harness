@@ -28,6 +28,8 @@ app = typer.Typer(
 )
 users_app = typer.Typer(help="Manage API users for server mode.")
 app.add_typer(users_app, name="users")
+db_app = typer.Typer(help="Manage the shared database schema.")
+app.add_typer(db_app, name="db")
 
 
 def _setup_logging() -> None:
@@ -114,6 +116,7 @@ def run(
                 thread_id = uuid4().hex
 
             async with AsyncSqliteSaver.from_conn_string(str(db)) as checkpointer:
+                await checkpointer.setup()
                 model = build_model(config)
                 agent = await build_agent(
                     config, root, checkpointer=checkpointer, model=model
@@ -267,6 +270,7 @@ def eval_command(
                 raise typer.Exit(1)
 
         async with AsyncSqliteSaver.from_conn_string(str(db)) as checkpointer:
+            await checkpointer.setup()
             model_obj = build_model(config)
             agent = await build_agent(config, root, checkpointer=checkpointer, model=model_obj)
 
@@ -345,18 +349,12 @@ def users_add(
 ) -> None:
     """Add a new API user. Prints the token ONCE."""
     _setup_logging()
-    from langchain_harness.serverdb import add_user, init_server_db, server_db_path
-
-    db_path = server_db_path(Path.cwd())
-    db_path.parent.mkdir(parents=True, exist_ok=True)
+    from langchain_harness.store import open_store
 
     async def _add() -> None:
-        import aiosqlite
-
-        async with aiosqlite.connect(str(db_path)) as conn:
-            await init_server_db(conn)
+        async with open_store(Path.cwd()) as store:
             try:
-                token = await add_user(conn, name)
+                token = await store.add_user(name)
             except ValueError as exc:
                 print(f"Error: {exc}", file=sys.stderr)
                 raise typer.Exit(1)
@@ -367,26 +365,23 @@ def users_add(
 
 @users_app.command("list")
 def users_list() -> None:
-    """List all API users."""
+    """List all API users, including ones auto-created by header/JWT auth."""
     _setup_logging()
-    from langchain_harness.serverdb import init_server_db, list_users, server_db_path
-
-    db_path = server_db_path(Path.cwd())
+    from langchain_harness.store import open_store
 
     async def _list() -> None:
-        import aiosqlite
-
-        async with aiosqlite.connect(str(db_path)) as conn:
-            await init_server_db(conn)
-            rows = await list_users(conn)
+        async with open_store(Path.cwd()) as store:
+            rows = await store.list_users()
         console = Console()
         if not rows:
             console.print("No users.")
             return
         for row in rows:
             status = "active" if row["is_active"] else "revoked"
+            via = row.get("auth_source") or "token"
             console.print(
-                f"{row['username']}  {row['user_id']}  {row['created_at']}  {status}"
+                f"{row['username']}  {row['user_id']}  {row['created_at']}  "
+                f"{status}  via={via}"
             )
 
     asyncio.run(_list())
@@ -398,16 +393,11 @@ def users_revoke(
 ) -> None:
     """Revoke an API user (deactivates their token)."""
     _setup_logging()
-    from langchain_harness.serverdb import init_server_db, revoke_user, server_db_path
-
-    db_path = server_db_path(Path.cwd())
+    from langchain_harness.store import open_store
 
     async def _revoke() -> None:
-        import aiosqlite
-
-        async with aiosqlite.connect(str(db_path)) as conn:
-            await init_server_db(conn)
-            found = await revoke_user(conn, name)
+        async with open_store(Path.cwd()) as store:
+            found = await store.revoke_user(name)
         if not found:
             print(f"Error: user {name!r} not found.", file=sys.stderr)
             raise typer.Exit(1)
@@ -416,11 +406,30 @@ def users_revoke(
     asyncio.run(_revoke())
 
 
+@db_app.command("init")
+def db_init() -> None:
+    """Create the users, sessions, and checkpoint schema (idempotent).
+
+    Uses Postgres when HARNESS_DATABASE_URL is set, otherwise SQLite under
+    <cwd>/.harness.
+    """
+    _setup_logging()
+    from langchain_harness.store import open_store
+
+    async def _init() -> None:
+        async with open_store(Path.cwd()) as store:
+            Console().print(
+                f"Initialized {store.backend} store at {store.describe()}."
+            )
+
+    asyncio.run(_init())
+
+
 # ---------------------------------------------------------------------------
 # dispatch
 # ---------------------------------------------------------------------------
 
-_KNOWN_SUBCOMMANDS = {"run", "sessions", "serve", "users", "memory", "eval"}
+_KNOWN_SUBCOMMANDS = {"run", "sessions", "serve", "users", "memory", "eval", "db"}
 
 # keep in sync with value-taking typer.Option declarations above
 _OPTIONS_WITH_VALUE = {

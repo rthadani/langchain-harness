@@ -38,6 +38,10 @@ Resolution order: **environment variables > CLI flags > `harness.toml`**.
 - `HARNESS_BASE_URL` — custom base URL for OpenAI-compatible endpoints.
 - `HARNESS_API_KEY` — explicit API key.
 - `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` — used as API-key fallbacks.
+- `HARNESS_DATABASE_URL` — Postgres DSN for server/user/session storage. When
+  unset the server uses SQLite under `<cwd>/.harness`. Applies to `serve`,
+  `users`, and `db init`; local `run`/`sessions`/`memory` still use SQLite.
+- `HARNESS_DATABASE_POOL_SIZE` — Postgres connection pool size (default 10).
 
 ### CLI flags
 
@@ -151,11 +155,15 @@ In server mode the inbox lives host-side at `<server-cwd>/.harness/memory/inbox/
 
 ## Server mode (multi-user web API)
 
-The harness can run as a multi-user web API server with per-user workspace isolation and token-based auth.
+The harness can run as a multi-user web API server with per-user workspace isolation and pluggable auth.
 
 ### Quick start
 
 ```bash
+# initialize the shared store (idempotent; uses Postgres when
+# HARNESS_DATABASE_URL is set, otherwise SQLite)
+uv run harness db init
+
 # add two users (tokens are printed once)
 uv run harness users add alice
 uv run harness users add bob
@@ -172,8 +180,10 @@ HARNESS_PROVIDER=anthropic HARNESS_MODEL=claude-3-5-sonnet-latest HARNESS_API_KE
 
 ### API surface
 
-All endpoints require `Authorization: Bearer harn_...`:
+Session endpoints require a credential matching one of the configured auth modes (see [Auth](#auth)):
 
+- `GET /healthz` — liveness; no auth. Returns 200 once the process serves HTTP.
+- `GET /readyz` — readiness; no auth. Returns 503 until startup finishes, then 200.
 - `POST /v1/sessions` — create a new session.
 - `GET /v1/sessions` — list the authenticated user's sessions only.
 - `GET /v1/sessions/{id}/history` — message history for a session.
@@ -189,8 +199,10 @@ Sessions in another user's database return `404` naturally — there is no owner
 Each user gets `<server-cwd>/.harness/users/<user_id>/` containing:
 
 - `workspace/` — the agent's filesystem backend root (a `FilesystemBackend` with no shell tool).
-- `sessions.db` — their own checkpoints + sessions table.
 - `conversation_history/` — lands inside the workspace automatically.
+
+With SQLite (the default) each user also has `sessions.db` for checkpoints and
+session rows. With Postgres those live in the shared database.
 
 **Shell is off by default** in server mode. The agent uses a plain `FilesystemBackend` that enforces per-user path isolation — the agent cannot access files outside its workspace root.
 
@@ -217,13 +229,93 @@ Add a `[server]` section to `harness.toml`:
 host = "127.0.0.1"
 port = 8000
 enable_shell = false
+auth_modes = ["token"]  # default
 ```
 
-Env overrides: `HARNESS_SERVER_HOST`, `HARNESS_SERVER_PORT`, `HARNESS_SERVER_ENABLE_SHELL`.
+Env overrides: `HARNESS_SERVER_HOST`, `HARNESS_SERVER_PORT`, `HARNESS_SERVER_ENABLE_SHELL`, `HARNESS_SERVER_AUTH_MODES`.
 
 ### Auth
 
+The server supports three auth modes, listed in precedence order under `[server] auth_modes`. The first mode that recognizes the request wins.
+
+```toml
+[server]
+auth_modes = ["token"]  # default
+```
+
+Modes:
+
+- `token` (default): `Authorization: Bearer harn_...` against the `users` table. Users are created ahead of time with `harness users add`.
+- `jwt`: `Authorization: Bearer <JWT>` verified against the issuer's JWKS via OIDC discovery. Users are created on first valid token. Requires the `jwt` extra: `pip install 'langchain-harness[jwt]'` (or `uv add --extra jwt`).
+- `trust`: `X-User-Id: <id>` believed as-is. Users are created on first request.
+
 Tokens are `harn_` + 32 bytes of URL-safe randomness, stored as SHA-256 hashes in a global `server.db` (separate from any user's session database). The plaintext token is shown only once at creation time.
+
+Trust and JWT users are auto-provisioned on first successful authentication. The `users.auth_source` column records how a user was created (`token`, `trust`, or `jwt`), and `harness users list` shows `via=<source>`.
+
+A user id that already exists under one source cannot be claimed from a different source. For example, if `alice` was provisioned as a token user, a request presenting `X-User-Id: alice` in `trust` mode or a JWT `sub: alice` will be rejected with `409 Conflict` rather than inheriting the existing user's workspace and sessions.
+
+**Warning:** `trust` mode is only safe behind an authenticating gateway. Anyone who can reach the server's port can claim any user id by sending the `X-User-Id` header, read that user's workspace and sessions, and allocate new workspaces without limit.
+
+#### Auto-provisioning cap
+
+To prevent unbounded user creation in `trust` or `jwt` mode, set a cap:
+
+```toml
+[server]
+max_auto_provisioned_users = 500  # default; <=0 is unlimited
+```
+
+Env override: `HARNESS_SERVER_MAX_AUTO_PROVISIONED_USERS`. Once the cap is reached, new auto-provisioned requests receive `429 Too Many Requests`; existing users continue to authenticate normally.
+
+#### JWT configuration
+
+When `auth_modes` includes `jwt`, configure verification in `[server.jwt]`:
+
+```toml
+[server]
+auth_modes = ["jwt", "token"]
+
+[server.jwt]
+issuer = "https://accounts.example.com"
+audience = "my-harness-api"
+user_claim = "sub"          # claim used as the harness user id
+```
+
+JWT mode requires both `issuer` and `audience` to be set; configuration that omits either is rejected at startup. `jwks_url` is optional and only overrides where the JWKS document is fetched from.
+
+Signing keys are fetched from the issuer's OIDC discovery document (`<issuer>/.well-known/openid-configuration`) unless `jwks_url` is set. Only asymmetric algorithms are supported: `RS256`/`RS384`/`RS512`, `ES256`/`ES384`/`ES512`, `PS256`/`PS384`/`PS512`, and `EdDSA`. HMAC (`HS*`) and `none` are forbidden — the verifier uses the issuer's public keys, so accepting a shared-secret algorithm would let anyone forge tokens.
+
+Env overrides: `HARNESS_SERVER_JWT_ISSUER`, `HARNESS_SERVER_JWT_AUDIENCE`, `HARNESS_SERVER_JWT_USER_CLAIM`, `HARNESS_SERVER_JWT_ALGORITHMS`, `HARNESS_SERVER_JWT_JWKS_URL`, `HARNESS_SERVER_JWT_CLOCK_SKEW_SECONDS`, `HARNESS_SERVER_JWT_DISCOVERY_TIMEOUT_SECONDS`.
+
+## Container image and Kubernetes
+
+`make wheel` builds `dist/*.whl` plus a hash-locked `dist/requirements.lock`.
+`make image` builds the reference container from that wheel and the chatbot
+profile in `deploy/agent/`.
+
+```bash
+make wheel
+podman build -t registry.example.com/chatbot:1.0.0 .
+podman run --rm -p 8000:8000 \
+  -e HARNESS_PROVIDER=openai -e HARNESS_MODEL=gpt-4o -e HARNESS_API_KEY=... \
+  -v harness-state:/app/.harness langchain-harness:0.1.0
+```
+
+Each image bakes one chatbot profile: system prompt, `CLAUDE.md`, `mcp.json`,
+and `harness.toml`. Select another profile with
+`--build-arg PROFILE_DIR=path/to/profile`. Reference manifests and the state
+recommendation are in `deploy/README.md`.
+
+The container defaults to single-replica SQLite under `/app/.harness`, which
+needs a ReadWriteOnce volume and `strategy: Recreate`. Do not put that volume
+on GCS FUSE.
+
+To run multiple replicas, set `HARNESS_DATABASE_URL` to a Postgres database.
+Users, sessions, and LangGraph checkpoints are then shared. The remaining
+constraint is workspace files under `users/<id>/workspace/`; to scale past one
+replica you must still share those with a ReadWriteMany volume or equivalent
+shared filesystem. Reference manifests are in `deploy/README.md`.
 
 ## Important risks and limitations
 
