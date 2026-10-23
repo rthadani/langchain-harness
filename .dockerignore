@@ -1,0 +1,26 @@
+# Runtime state must never be baked into an image: it contains session
+# databases and may contain user data.
+.harness/
+
+# Python build/runtime junk
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# VCS and local tooling
+.git/
+.gitignore
+.mypy_cache/
+.ruff_cache/
+
+# Not needed by the Dockerfile (the wheel is already built)
+src/
+tests/
+uv.lock
+scripts/
+.claude/
+README.md
+
+# Keep dist/*.whl and dist/requirements.lock; drop the rest of dist
+dist/.gitignore
