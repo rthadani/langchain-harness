@@ -1,0 +1,129 @@
+# Core deployment: secret, state volume, server, and service.
+#
+# Deploy order:
+#   kubectl apply -f deploy/k8s.yaml
+#
+# SQLite state is single-writer; keep replicas: 1 and strategy: Recreate.
+# See deploy/README.md for scaling past one replica with Postgres and a
+# shared workspace volume.
+
+apiVersion: v1
+kind: Secret
+metadata:
+  name: harness-secrets
+type: Opaque
+stringData:
+  HARNESS_PROVIDER: openai
+  HARNESS_MODEL: gpt-4o
+  # Replace. Prefer `kubectl create secret generic ... --from-literal` or an
+  # external secret manager over committing a real key here.
+  HARNESS_API_KEY: replace-me
+  # Uncomment to use Postgres instead of SQLite. The image includes psycopg
+  # because dist/requirements.lock is exported with --extra postgres.
+  # HARNESS_DATABASE_URL: postgresql://user:pass@postgres-service:5432/harness
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: harness-state
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+  # storageClassName: standard-rwo
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: harness
+spec:
+  # SQLite state is single-writer. With HARNESS_DATABASE_URL set, sessions
+  # and checkpoints are shared and this can be >1, but workspace files still
+  # need a ReadWriteMany volume; see deploy/README.md.
+  replicas: 1
+  strategy:
+    # Recreate, not RollingUpdate: two pods cannot safely share the
+    # ReadWriteOnce SQLite volume.
+    type: Recreate
+  selector:
+    matchLabels:
+      app: harness
+  template:
+    metadata:
+      labels:
+        app: harness
+    spec:
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        # Makes the mounted volume writable by the non-root app user.
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      containers:
+        - name: harness
+          # Replace with your registry reference when pushing the image.
+          image: langchain-harness:0.1.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+          envFrom:
+            - secretRef:
+                name: harness-secrets
+          env:
+            - name: HARNESS_SERVER_HOST
+              value: "0.0.0.0"
+            - name: HARNESS_SERVER_PORT
+              value: "8000"
+            # Optional: cap the Postgres connection pool (default 10).
+            # - name: HARNESS_DATABASE_POOL_SIZE
+            #   value: "10"
+            # Shell access would let an agent read other users' workspaces.
+            - name: HARNESS_SERVER_ENABLE_SHELL
+              value: "false"
+          volumeMounts:
+            - name: state
+              mountPath: /app/.harness
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              memory: 2Gi
+      volumes:
+        - name: state
+          persistentVolumeClaim:
+            claimName: harness-state
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: harness
+spec:
+  selector:
+    app: harness
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+  type: ClusterIP

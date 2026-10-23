@@ -1,0 +1,23 @@
+# Model settings come from the environment:
+#   HARNESS_PROVIDER (default: anthropic)
+#   HARNESS_MODEL    (required)
+#   HARNESS_API_KEY  (required unless a provider-specific key is exported)
+#
+# [model]
+# provider = "openai"
+# model = "gpt-4o"
+# base_url = "https://api.openai.com/v1"
+
+[server]
+host = "0.0.0.0"
+port = 8000
+enable_shell = false
+
+[prompts]
+# Loaded relative to the server working directory (/app in the image).
+system = "file:prompts/system.md"
+
+# Compaction is left to deepagents defaults unless configured.
+# [compaction]
+# trigger_messages = 60
+# keep_messages = 20
