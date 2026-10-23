@@ -7,22 +7,15 @@ the precedence.
 
 Modes:
 
-- ``token``: ``Authorization: Bearer harn_...`` looked up in the ``users``
-  table. Users are created ahead of time with ``harness users add``.
+- ``trust``: ``X-User-Id: <id>`` believed as-is, for deployments behind an
+  authenticating gateway.
 - ``jwt``: ``Authorization: Bearer <JWT>`` verified against the issuer's JWKS
-  (OIDC discovery). Users are created on first valid token.
-- ``trust``: ``X-User-Id: <id>`` believed as-is, for tests and deployments
-  behind an authenticating gateway. Users are created on first request.
-
-The token and jwt modes split on credential shape (a JWT has two dots), so
-listing them in either order behaves the same. ``trust`` reads a different
-header and never collides with either.
+  (OIDC discovery). The user id is taken from the configured claim.
 """
 
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import logging
 import re
 from dataclasses import dataclass, field
@@ -31,8 +24,6 @@ from typing import Any, Protocol
 from fastapi import HTTPException, Request, status
 
 from langchain_harness.config import KNOWN_AUTH_MODES, JwtConfig, ServerConfig
-from langchain_harness.serverdb import UserIdConflict
-from langchain_harness.store import Store
 
 logger = logging.getLogger(__name__)
 
@@ -86,94 +77,16 @@ def _looks_like_jwt(token: str) -> bool:
     return token.count(".") == 2
 
 
-async def _provisioned_user(
-    store: Store,
-    user_id: str,
-    source: str,
-    *,
-    max_auto_provisioned_users: int = 500,
-) -> dict[str, Any]:
-    """Resolve (creating if new) the user for an externally authenticated id."""
-    existing = await store.get_user_by_username(user_id)
-    if existing is not None:
-        effective_source = existing.get("auth_source") or "token"
-        if effective_source != source:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=f"User id '{user_id}' belongs to a different authentication source",
-            )
-        if not existing["is_active"]:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED, detail="User is revoked"
-            )
-        return existing
-
-    if max_auto_provisioned_users > 0:
-        count = await store.count_provisioned_users()
-        if count >= max_auto_provisioned_users:
-            raise HTTPException(
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail=(
-                    f"Auto-provisioned user cap reached ({count}/"
-                    f"{max_auto_provisioned_users}). Raise [server] "
-                    "max_auto_provisioned_users or set "
-                    "HARNESS_SERVER_MAX_AUTO_PROVISIONED_USERS."
-                ),
-            )
-
-    try:
-        return await store.get_or_create_user(user_id, source=source)
-    except UserIdConflict:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=f"User id '{user_id}' belongs to a different authentication source",
-        ) from None
-
-
-class TokenAuthenticator:
-    """``Authorization: Bearer harn_...`` against the users table."""
-
-    name = "token"
-
-    def __init__(self, store: Store) -> None:
-        self.store = store
-
-    async def resolve(self, request: Request) -> dict[str, Any] | None:
-        token = _bearer_token(request)
-        if token is None or _looks_like_jwt(token):
-            return None
-
-        token_hash = hashlib.sha256(token.encode()).hexdigest()
-        user = await self.store.get_user_by_token_hash(token_hash)
-        if user is None or not user["is_active"]:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid or revoked token",
-            )
-        return user
-
-
 class TrustHeaderAuthenticator:
     """``X-User-Id`` taken at face value; the caller is already trusted."""
 
     name = "trust"
 
-    def __init__(
-        self, store: Store, *, max_auto_provisioned_users: int = 500
-    ) -> None:
-        self.store = store
-        self.max_auto_provisioned_users = max_auto_provisioned_users
-
     async def resolve(self, request: Request) -> dict[str, Any] | None:
         raw = request.headers.get(USER_ID_HEADER)
         if raw is None:
             return None
-        return await _provisioned_user(
-            self.store,
-            sanitize_user_id(raw),
-            "trust",
-            max_auto_provisioned_users=self.max_auto_provisioned_users,
-        )
+        return {"user_id": sanitize_user_id(raw)}
 
 
 class JwtAuthenticator:
@@ -181,16 +94,8 @@ class JwtAuthenticator:
 
     name = "jwt"
 
-    def __init__(
-        self,
-        store: Store,
-        config: JwtConfig,
-        *,
-        max_auto_provisioned_users: int = 500,
-    ) -> None:
-        self.store = store
+    def __init__(self, config: JwtConfig) -> None:
         self.config = config
-        self.max_auto_provisioned_users = max_auto_provisioned_users
         self._jwk_client: Any = None
         # Serializes discovery so a burst of first requests does not stampede
         # the identity provider.
@@ -203,12 +108,7 @@ class JwtAuthenticator:
 
         claims = await self._decode(token)
         user_id = sanitize_user_id(claims.get(self.config.user_claim))
-        return await _provisioned_user(
-            self.store,
-            user_id,
-            "jwt",
-            max_auto_provisioned_users=self.max_auto_provisioned_users,
-        )
+        return {"user_id": user_id}
 
     async def _decode(self, token: str) -> dict[str, Any]:
         jwt_module = _import_pyjwt()
@@ -332,9 +232,9 @@ class AuthChain:
         )
 
 
-def build_auth(config: ServerConfig, store: Store) -> AuthChain:
+def build_auth(config: ServerConfig) -> AuthChain:
     """Build the auth chain described by ``config.auth_modes``."""
-    modes = tuple(config.auth_modes) or ("token",)
+    modes = tuple(config.auth_modes) or ("trust",)
     unknown = [mode for mode in modes if mode not in KNOWN_AUTH_MODES]
     if unknown:
         raise ValueError(
@@ -343,13 +243,8 @@ def build_auth(config: ServerConfig, store: Store) -> AuthChain:
         )
 
     builders = {
-        "token": lambda: TokenAuthenticator(store),
-        "trust": lambda: TrustHeaderAuthenticator(
-            store, max_auto_provisioned_users=config.max_auto_provisioned_users
-        ),
-        "jwt": lambda: JwtAuthenticator(
-            store, config.jwt, max_auto_provisioned_users=config.max_auto_provisioned_users
-        ),
+        "trust": lambda: TrustHeaderAuthenticator(),
+        "jwt": lambda: JwtAuthenticator(config.jwt),
     }
     chain = AuthChain([builders[mode]() for mode in modes])
 
@@ -367,18 +262,13 @@ def build_auth(config: ServerConfig, store: Store) -> AuthChain:
             "issuer for a different application is accepted here. Set "
             "[server.jwt] audience to the value this API is registered under."
         )
-    if "token" not in chain.modes:
-        logger.info(
-            "Auth mode 'token' is disabled; `harness users add` tokens will not "
-            "authenticate. Revocation via `harness users revoke` still applies."
-        )
     return chain
 
 
 async def get_current_user(request: Request) -> dict[str, Any]:
     """FastAPI dependency: resolve the request to a user dict.
 
-    Raises 400 (missing credential under ``trust``), 401 (invalid/revoked), or
+    Raises 400 (missing credential under ``trust``), 401 (invalid token), or
     503 (identity provider unreachable).
     """
     return await request.app.state.auth.authenticate(request)

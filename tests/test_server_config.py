@@ -83,11 +83,11 @@ def test_server_invalid_port_falls_back(tmp_path: Path, monkeypatch) -> None:
     assert config.server.port == 8000
 
 
-def test_server_auth_modes_default_is_token(tmp_path: Path, monkeypatch) -> None:
+def test_server_auth_modes_default_is_trust(tmp_path: Path, monkeypatch) -> None:
     _clear_keys(monkeypatch)
     monkeypatch.setenv("HARNESS_MODEL", "gpt-4")
     config = resolve_config(tmp_path)
-    assert config.server.auth_modes == ("token",)
+    assert config.server.auth_modes == ("trust",)
 
 
 def test_server_auth_modes_from_toml(tmp_path: Path, monkeypatch) -> None:
@@ -105,13 +105,13 @@ def test_server_auth_modes_from_toml(tmp_path: Path, monkeypatch) -> None:
 def test_server_auth_modes_env_overrides_toml(tmp_path: Path, monkeypatch) -> None:
     _clear_keys(monkeypatch)
     monkeypatch.setenv("HARNESS_MODEL", "gpt-4")
-    monkeypatch.setenv("HARNESS_SERVER_AUTH_MODES", "token,trust")
+    monkeypatch.setenv("HARNESS_SERVER_AUTH_MODES", "trust,jwt")
     (tmp_path / "harness.toml").write_text(
-        "[server]\nauth_modes = ['jwt', 'trust']\n\n[server.jwt]\nissuer = 'https://id.example.com'\n",
+        "[server]\nauth_modes = ['jwt', 'trust']\n\n[server.jwt]\nissuer = 'https://id.example.com'\naudience = 'my-api'\n",
         encoding="utf-8",
     )
     config = resolve_config(tmp_path)
-    assert config.server.auth_modes == ("token", "trust")
+    assert config.server.auth_modes == ("trust", "jwt")
 
 
 def test_server_unknown_auth_mode_exits(tmp_path: Path, monkeypatch) -> None:
@@ -129,14 +129,14 @@ def test_server_duplicate_auth_modes_exits(tmp_path: Path, monkeypatch) -> None:
     _clear_keys(monkeypatch)
     monkeypatch.setenv("HARNESS_MODEL", "gpt-4")
     (tmp_path / "harness.toml").write_text(
-        "[server]\nauth_modes = ['token', 'token']\n",
+        "[server]\nauth_modes = ['trust', 'trust']\n",
         encoding="utf-8",
     )
     with pytest.raises(SystemExit):
         resolve_config(tmp_path)
 
 
-def test_server_jwt_without_issuer_or_jwks_url_exits(tmp_path: Path, monkeypatch) -> None:
+def test_server_jwt_without_issuer_or_audience_exits(tmp_path: Path, monkeypatch) -> None:
     _clear_keys(monkeypatch)
     monkeypatch.setenv("HARNESS_MODEL", "gpt-4")
     (tmp_path / "harness.toml").write_text(
@@ -220,3 +220,31 @@ def test_server_jwt_env_overrides_toml(tmp_path: Path, monkeypatch) -> None:
     assert jwt.jwks_url == "https://env.example.com/jwks"
     assert jwt.clock_skew_seconds == 90
     assert jwt.discovery_timeout_seconds == 15.5
+
+
+def test_config_jwt_algorithm_hs256_exits(tmp_path: Path, monkeypatch) -> None:
+    _clear_keys(monkeypatch)
+    monkeypatch.setenv("HARNESS_MODEL", "gpt-4")
+    (tmp_path / "harness.toml").write_text(
+        "[server]\nauth_modes = ['jwt']\n\n[server.jwt]\n"
+        "issuer = 'https://id.example.com'\naudience = 'my-api'\n"
+        "algorithms = ['HS256']\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(SystemExit):
+        resolve_config(tmp_path)
+
+
+def test_config_discovery_timeout_zero_preserved(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _clear_keys(monkeypatch)
+    monkeypatch.setenv("HARNESS_MODEL", "gpt-4")
+    (tmp_path / "harness.toml").write_text(
+        "[server]\nauth_modes = ['jwt']\n\n[server.jwt]\n"
+        "issuer = 'https://id.example.com'\naudience = 'my-api'\n"
+        "discovery_timeout_seconds = 0\n",
+        encoding="utf-8",
+    )
+    config = resolve_config(tmp_path)
+    assert config.server.jwt.discovery_timeout_seconds == 0.0

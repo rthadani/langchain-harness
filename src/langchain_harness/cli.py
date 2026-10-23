@@ -26,8 +26,6 @@ app = typer.Typer(
     help="LangChain deepagents harness (Claude Code style).",
     context_settings={"help_option_names": ["--help", "-h"]},
 )
-users_app = typer.Typer(help="Manage API users for server mode.")
-app.add_typer(users_app, name="users")
 db_app = typer.Typer(help="Manage the shared database schema.")
 app.add_typer(db_app, name="db")
 
@@ -338,77 +336,9 @@ def serve(
     uvicorn.run(fastapi_app, host=bind_host, port=bind_port)
 
 
-# ---------------------------------------------------------------------------
-# users subcommands
-# ---------------------------------------------------------------------------
-
-
-@users_app.command("add")
-def users_add(
-    name: str = typer.Argument(..., help="Username to add."),
-) -> None:
-    """Add a new API user. Prints the token ONCE."""
-    _setup_logging()
-    from langchain_harness.store import open_store
-
-    async def _add() -> None:
-        async with open_store(Path.cwd()) as store:
-            try:
-                token = await store.add_user(name)
-            except ValueError as exc:
-                print(f"Error: {exc}", file=sys.stderr)
-                raise typer.Exit(1)
-            print(token)
-
-    asyncio.run(_add())
-
-
-@users_app.command("list")
-def users_list() -> None:
-    """List all API users, including ones auto-created by header/JWT auth."""
-    _setup_logging()
-    from langchain_harness.store import open_store
-
-    async def _list() -> None:
-        async with open_store(Path.cwd()) as store:
-            rows = await store.list_users()
-        console = Console()
-        if not rows:
-            console.print("No users.")
-            return
-        for row in rows:
-            status = "active" if row["is_active"] else "revoked"
-            via = row.get("auth_source") or "token"
-            console.print(
-                f"{row['username']}  {row['user_id']}  {row['created_at']}  "
-                f"{status}  via={via}"
-            )
-
-    asyncio.run(_list())
-
-
-@users_app.command("revoke")
-def users_revoke(
-    name: str = typer.Argument(..., help="Username to revoke."),
-) -> None:
-    """Revoke an API user (deactivates their token)."""
-    _setup_logging()
-    from langchain_harness.store import open_store
-
-    async def _revoke() -> None:
-        async with open_store(Path.cwd()) as store:
-            found = await store.revoke_user(name)
-        if not found:
-            print(f"Error: user {name!r} not found.", file=sys.stderr)
-            raise typer.Exit(1)
-        print(f"Revoked user {name!r}.")
-
-    asyncio.run(_revoke())
-
-
 @db_app.command("init")
 def db_init() -> None:
-    """Create the users, sessions, and checkpoint schema (idempotent).
+    """Create the sessions and checkpoint schema (idempotent).
 
     Uses Postgres when HARNESS_DATABASE_URL is set, otherwise SQLite under
     <cwd>/.harness.
@@ -429,7 +359,7 @@ def db_init() -> None:
 # dispatch
 # ---------------------------------------------------------------------------
 
-_KNOWN_SUBCOMMANDS = {"run", "sessions", "serve", "users", "memory", "eval", "db"}
+_KNOWN_SUBCOMMANDS = {"run", "sessions", "serve", "memory", "eval", "db"}
 
 # keep in sync with value-taking typer.Option declarations above
 _OPTIONS_WITH_VALUE = {

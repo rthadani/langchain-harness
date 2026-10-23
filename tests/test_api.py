@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 from typing import Any
 
 import httpx
@@ -11,7 +10,6 @@ import pytest
 from langchain_harness.api.app import create_app
 from langchain_harness.config import Config
 from langchain_harness.memory import inbox_dir, list_inbox
-from langchain_harness.serverdb import add_user, hash_token, init_server_db, server_db_path
 
 
 class _FakeState:
@@ -95,22 +93,8 @@ class _FakeCheckpointer:
 
 @pytest.fixture
 async def test_env(tmp_path, monkeypatch):
-    """Set up a full test environment with two users and their tokens."""
+    """Set up a full test environment with two trust-mode identities."""
     monkeypatch.chdir(tmp_path)
-
-    # Create server.db and add two users
-    db_path = server_db_path(tmp_path)
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-
-    import aiosqlite
-
-    token_a: str = ""
-    token_b: str = ""
-
-    async with aiosqlite.connect(str(db_path)) as conn:
-        await init_server_db(conn)
-        token_a = await add_user(conn, "alice")
-        token_b = await add_user(conn, "bob")
 
     config = Config(provider="anthropic", model="test-model")
 
@@ -132,8 +116,6 @@ async def test_env(tmp_path, monkeypatch):
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
             yield {
                 "client": client,
-                "token_a": token_a,
-                "token_b": token_b,
                 "agent": fake_agent,
                 "tmp_path": tmp_path,
             }
@@ -144,47 +126,59 @@ class _Chunk:
         self.content = content
 
 
+# --- health tests ---
+
+
+@pytest.mark.asyncio
+async def test_healthz_needs_no_auth(test_env) -> None:
+    resp = await test_env["client"].get("/healthz")
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "ok"}
+
+
+@pytest.mark.asyncio
+async def test_readyz_needs_no_auth(test_env) -> None:
+    resp = await test_env["client"].get("/readyz")
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "ready"}
+
+
+@pytest.mark.asyncio
+async def test_readyz_503_before_startup(tmp_path) -> None:
+    app = create_app(tmp_path, Config(provider="anthropic", model="test-model"))
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get("/readyz")
+    assert resp.status_code == 503
+    assert resp.json() == {"status": "starting"}
+
+
 # --- auth tests ---
 
 
 @pytest.mark.asyncio
-async def test_auth_valid_token_returns_200(test_env) -> None:
+async def test_auth_valid_header_returns_200(test_env) -> None:
     resp = await test_env["client"].get(
         "/v1/sessions",
-        headers={"Authorization": f"Bearer {test_env['token_a']}"},
+        headers={"X-User-Id": "alice"},
     )
     assert resp.status_code == 200
 
 
 @pytest.mark.asyncio
-async def test_auth_invalid_token_returns_401(test_env) -> None:
-    resp = await test_env["client"].get(
-        "/v1/sessions",
-        headers={"Authorization": "Bearer harn_invalid_token"},
-    )
-    assert resp.status_code == 401
-
-
-@pytest.mark.asyncio
-async def test_auth_missing_header_returns_401(test_env) -> None:
+async def test_auth_missing_header_returns_400(test_env) -> None:
     resp = await test_env["client"].get("/v1/sessions")
-    assert resp.status_code == 401
+    assert resp.status_code == 400
+    assert "X-User-Id" in resp.json()["detail"]
 
 
 @pytest.mark.asyncio
-async def test_auth_revoked_user_returns_401(test_env, tmp_path) -> None:
-    # Revoke alice
-    from langchain_harness.serverdb import revoke_user
-    import aiosqlite
-
-    async with aiosqlite.connect(str(server_db_path(tmp_path))) as conn:
-        await revoke_user(conn, "alice")
-
+async def test_auth_invalid_header_returns_400(test_env) -> None:
     resp = await test_env["client"].get(
         "/v1/sessions",
-        headers={"Authorization": f"Bearer {test_env['token_a']}"},
+        headers={"X-User-Id": "../etc"},
     )
-    assert resp.status_code == 401
+    assert resp.status_code == 400
 
 
 # --- privacy tests ---
@@ -196,7 +190,7 @@ async def test_privacy_user_b_cannot_see_user_a_session(test_env) -> None:
     resp = await test_env["client"].post(
         "/v1/sessions",
         json={"title": "alice's session"},
-        headers={"Authorization": f"Bearer {test_env['token_a']}"},
+        headers={"X-User-Id": "alice"},
     )
     assert resp.status_code == 200
     session_id = resp.json()["session_id"]
@@ -204,14 +198,14 @@ async def test_privacy_user_b_cannot_see_user_a_session(test_env) -> None:
     # Bob tries to access it → 404
     resp = await test_env["client"].get(
         f"/v1/sessions/{session_id}/history",
-        headers={"Authorization": f"Bearer {test_env['token_b']}"},
+        headers={"X-User-Id": "bob"},
     )
     assert resp.status_code == 404
 
     # Bob tries to delete it → 404
     resp = await test_env["client"].delete(
         f"/v1/sessions/{session_id}",
-        headers={"Authorization": f"Bearer {test_env['token_b']}"},
+        headers={"X-User-Id": "bob"},
     )
     assert resp.status_code == 404
 
@@ -224,7 +218,7 @@ async def test_create_session(test_env) -> None:
     resp = await test_env["client"].post(
         "/v1/sessions",
         json={"title": "test session"},
-        headers={"Authorization": f"Bearer {test_env['token_a']}"},
+        headers={"X-User-Id": "alice"},
     )
     assert resp.status_code == 200
     data = resp.json()
@@ -240,19 +234,19 @@ async def test_list_sessions_only_own(test_env) -> None:
         await test_env["client"].post(
             "/v1/sessions",
             json={"title": f"alice-{i}"},
-            headers={"Authorization": f"Bearer {test_env['token_a']}"},
+            headers={"X-User-Id": "alice"},
         )
     # Bob creates 1 session
     await test_env["client"].post(
         "/v1/sessions",
         json={"title": "bob-0"},
-        headers={"Authorization": f"Bearer {test_env['token_b']}"},
+        headers={"X-User-Id": "bob"},
     )
 
     # Alice sees only her 2
     resp = await test_env["client"].get(
         "/v1/sessions",
-        headers={"Authorization": f"Bearer {test_env['token_a']}"},
+        headers={"X-User-Id": "alice"},
     )
     assert resp.status_code == 200
     sessions = resp.json()
@@ -262,7 +256,7 @@ async def test_list_sessions_only_own(test_env) -> None:
     # Bob sees only his 1
     resp = await test_env["client"].get(
         "/v1/sessions",
-        headers={"Authorization": f"Bearer {test_env['token_b']}"},
+        headers={"X-User-Id": "bob"},
     )
     assert resp.status_code == 200
     sessions = resp.json()
@@ -276,21 +270,21 @@ async def test_delete_session(test_env) -> None:
     resp = await test_env["client"].post(
         "/v1/sessions",
         json={"title": "to delete"},
-        headers={"Authorization": f"Bearer {test_env['token_a']}"},
+        headers={"X-User-Id": "alice"},
     )
     session_id = resp.json()["session_id"]
 
     # Delete
     resp = await test_env["client"].delete(
         f"/v1/sessions/{session_id}",
-        headers={"Authorization": f"Bearer {test_env['token_a']}"},
+        headers={"X-User-Id": "alice"},
     )
     assert resp.status_code == 200
 
     # List should be empty
     resp = await test_env["client"].get(
         "/v1/sessions",
-        headers={"Authorization": f"Bearer {test_env['token_a']}"},
+        headers={"X-User-Id": "alice"},
     )
     assert len(resp.json()) == 0
 
@@ -300,17 +294,6 @@ async def test_delete_session_calls_checkpointer_adelete_thread(tmp_path, monkey
     """When the agent exposes a checkpointer, delete_session awaits
     adelete_thread with the correct thread_id and still deletes the row."""
     monkeypatch.chdir(tmp_path)
-
-    import aiosqlite
-    from langchain_harness.api.app import create_app
-    from langchain_harness.serverdb import add_user, init_server_db, server_db_path
-
-    db_path = server_db_path(tmp_path)
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-
-    async with aiosqlite.connect(str(db_path)) as conn:
-        await init_server_db(conn)
-        token = await add_user(conn, "alice")
 
     checkpointer = _FakeCheckpointer()
     fake_agent = _FakeAgent(checkpointer=checkpointer)
@@ -328,7 +311,7 @@ async def test_delete_session_calls_checkpointer_adelete_thread(tmp_path, monkey
             resp = await client.post(
                 "/v1/sessions",
                 json={"title": "checkpoint test"},
-                headers={"Authorization": f"Bearer {token}"},
+                headers={"X-User-Id": "alice"},
             )
             assert resp.status_code == 200
             session_id = resp.json()["session_id"]
@@ -336,7 +319,7 @@ async def test_delete_session_calls_checkpointer_adelete_thread(tmp_path, monkey
             # Delete it
             resp = await client.delete(
                 f"/v1/sessions/{session_id}",
-                headers={"Authorization": f"Bearer {token}"},
+                headers={"X-User-Id": "alice"},
             )
             assert resp.status_code == 200
 
@@ -346,7 +329,7 @@ async def test_delete_session_calls_checkpointer_adelete_thread(tmp_path, monkey
             # Session row was also deleted
             resp = await client.get(
                 "/v1/sessions",
-                headers={"Authorization": f"Bearer {token}"},
+                headers={"X-User-Id": "alice"},
             )
             assert resp.json() == []
 
@@ -355,13 +338,13 @@ async def test_delete_foreign_session_404(test_env) -> None:
     resp = await test_env["client"].post(
         "/v1/sessions",
         json={"title": "alice's"},
-        headers={"Authorization": f"Bearer {test_env['token_a']}"},
+        headers={"X-User-Id": "alice"},
     )
     session_id = resp.json()["session_id"]
 
     resp = await test_env["client"].delete(
         f"/v1/sessions/{session_id}",
-        headers={"Authorization": f"Bearer {test_env['token_b']}"},
+        headers={"X-User-Id": "bob"},
     )
     assert resp.status_code == 404
 
@@ -375,7 +358,7 @@ async def test_sse_streaming_shows_tokens_and_done(test_env) -> None:
     resp = await test_env["client"].post(
         "/v1/sessions",
         json={"title": "sse test"},
-        headers={"Authorization": f"Bearer {test_env['token_a']}"},
+        headers={"X-User-Id": "alice"},
     )
     session_id = resp.json()["session_id"]
 
@@ -383,7 +366,7 @@ async def test_sse_streaming_shows_tokens_and_done(test_env) -> None:
     resp = await test_env["client"].post(
         f"/v1/sessions/{session_id}/messages",
         json={"content": "hello"},
-        headers={"Authorization": f"Bearer {test_env['token_a']}"},
+        headers={"X-User-Id": "alice"},
     )
     assert resp.status_code == 200
     assert resp.headers["content-type"].startswith("text/event-stream")
@@ -400,14 +383,14 @@ async def test_sse_404_on_foreign_session(test_env) -> None:
     resp = await test_env["client"].post(
         "/v1/sessions",
         json={"title": "alice's"},
-        headers={"Authorization": f"Bearer {test_env['token_a']}"},
+        headers={"X-User-Id": "alice"},
     )
     session_id = resp.json()["session_id"]
 
     resp = await test_env["client"].post(
         f"/v1/sessions/{session_id}/messages",
         json={"content": "hello"},
-        headers={"Authorization": f"Bearer {test_env['token_b']}"},
+        headers={"X-User-Id": "bob"},
     )
     assert resp.status_code == 404
 
@@ -418,13 +401,13 @@ async def test_compact_endpoint_streams(test_env) -> None:
     resp = await test_env["client"].post(
         "/v1/sessions",
         json={"title": "compact test"},
-        headers={"Authorization": f"Bearer {test_env['token_a']}"},
+        headers={"X-User-Id": "alice"},
     )
     session_id = resp.json()["session_id"]
 
     resp = await test_env["client"].post(
         f"/v1/sessions/{session_id}/compact",
-        headers={"Authorization": f"Bearer {test_env['token_a']}"},
+        headers={"X-User-Id": "alice"},
     )
     assert resp.status_code == 200
     assert resp.headers["content-type"].startswith("text/event-stream")
@@ -439,13 +422,13 @@ async def test_history_empty_session(test_env) -> None:
     resp = await test_env["client"].post(
         "/v1/sessions",
         json={"title": "history test"},
-        headers={"Authorization": f"Bearer {test_env['token_a']}"},
+        headers={"X-User-Id": "alice"},
     )
     session_id = resp.json()["session_id"]
 
     resp = await test_env["client"].get(
         f"/v1/sessions/{session_id}/history",
-        headers={"Authorization": f"Bearer {test_env['token_a']}"},
+        headers={"X-User-Id": "alice"},
     )
     assert resp.status_code == 200
     assert resp.json() == []
@@ -455,15 +438,6 @@ async def test_history_empty_session(test_env) -> None:
 async def test_history_returns_messages_after_send(tmp_path, monkeypatch) -> None:
     """Send a message, then fetch history — real message shapes must be present."""
     monkeypatch.chdir(tmp_path)
-
-    import aiosqlite
-
-    db_path = server_db_path(tmp_path)
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-
-    async with aiosqlite.connect(str(db_path)) as conn:
-        await init_server_db(conn)
-        token = await add_user(conn, "alice")
 
     config = Config(provider="anthropic", model="test-model")
     app = create_app(tmp_path, config)
@@ -487,7 +461,7 @@ async def test_history_returns_messages_after_send(tmp_path, monkeypatch) -> Non
             resp = await client.post(
                 "/v1/sessions",
                 json={"title": "history test"},
-                headers={"Authorization": f"Bearer {token}"},
+                headers={"X-User-Id": "alice"},
             )
             session_id = resp.json()["session_id"]
 
@@ -495,14 +469,14 @@ async def test_history_returns_messages_after_send(tmp_path, monkeypatch) -> Non
             resp = await client.post(
                 f"/v1/sessions/{session_id}/messages",
                 json={"content": "hello"},
-                headers={"Authorization": f"Bearer {token}"},
+                headers={"X-User-Id": "alice"},
             )
             assert resp.status_code == 200
 
             # Fetch history — should contain real message shapes
             resp = await client.get(
                 f"/v1/sessions/{session_id}/history",
-                headers={"Authorization": f"Bearer {token}"},
+                headers={"X-User-Id": "alice"},
             )
             assert resp.status_code == 200
             messages = resp.json()
@@ -518,19 +492,8 @@ async def test_history_returns_messages_after_send(tmp_path, monkeypatch) -> Non
 
 @pytest.mark.asyncio
 async def test_smoke_isolation_two_users(tmp_path, monkeypatch):
-    """Smoke test: add two users, list sessions for each, assert isolation."""
+    """Smoke test: two identities via trust mode, list sessions for each, assert isolation."""
     monkeypatch.chdir(tmp_path)
-
-    import aiosqlite
-    from langchain_harness.serverdb import add_user, init_server_db
-
-    db_path = server_db_path(tmp_path)
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-
-    async with aiosqlite.connect(str(db_path)) as conn:
-        await init_server_db(conn)
-        token_a = await add_user(conn, "alice")
-        token_b = await add_user(conn, "bob")
 
     config = Config(provider="anthropic", model="test-model")
     app = create_app(tmp_path, config)
@@ -548,19 +511,19 @@ async def test_smoke_isolation_two_users(tmp_path, monkeypatch):
                 await client.post(
                     "/v1/sessions",
                     json={"title": f"a{i}"},
-                    headers={"Authorization": f"Bearer {token_a}"},
+                    headers={"X-User-Id": "alice"},
                 )
             # Bob creates 1 session
             await client.post(
                 "/v1/sessions",
                 json={"title": "b0"},
-                headers={"Authorization": f"Bearer {token_b}"},
+                headers={"X-User-Id": "bob"},
             )
 
             # Alice sees 3
             resp = await client.get(
                 "/v1/sessions",
-                headers={"Authorization": f"Bearer {token_a}"},
+                headers={"X-User-Id": "alice"},
             )
             assert resp.status_code == 200
             assert len(resp.json()) == 3
@@ -568,7 +531,7 @@ async def test_smoke_isolation_two_users(tmp_path, monkeypatch):
             # Bob sees 1
             resp = await client.get(
                 "/v1/sessions",
-                headers={"Authorization": f"Bearer {token_b}"},
+                headers={"X-User-Id": "bob"},
             )
             assert resp.status_code == 200
             assert len(resp.json()) == 1
@@ -581,18 +544,10 @@ async def _make_app_env(tmp_path, monkeypatch, *, agent, shared_model):
     """Create an app whose per-user agent and shared model are fakes."""
     monkeypatch.chdir(tmp_path)
 
-    import aiosqlite
-
-    db_path = server_db_path(tmp_path)
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    async with aiosqlite.connect(str(db_path)) as conn:
-        await init_server_db(conn)
-        token = await add_user(conn, "alice")
-
     config = Config(provider="anthropic", model="test-model")
     app = create_app(tmp_path, config)
     cache = _FakeAgentCache(agent, shared_model=shared_model)
-    return app, cache, token
+    return app, cache
 
 
 @pytest.mark.asyncio
@@ -601,7 +556,7 @@ async def test_summarize_endpoint_queues_note(tmp_path, monkeypatch) -> None:
         state_messages=[_FakeMsg("human", "hi"), _FakeMsg("ai", "hello")]
     )
     model = _FakeSummarizingModel("- summary bullet")
-    app, cache, token = await _make_app_env(
+    app, cache = await _make_app_env(
         tmp_path, monkeypatch, agent=agent, shared_model=model
     )
 
@@ -613,13 +568,13 @@ async def test_summarize_endpoint_queues_note(tmp_path, monkeypatch) -> None:
             resp = await client.post(
                 "/v1/sessions",
                 json={"title": "memory session"},
-                headers={"Authorization": f"Bearer {token}"},
+                headers={"X-User-Id": "alice"},
             )
             session_id = resp.json()["session_id"]
 
             resp = await client.post(
                 f"/v1/sessions/{session_id}/summarize",
-                headers={"Authorization": f"Bearer {token}"},
+                headers={"X-User-Id": "alice"},
             )
 
     assert resp.status_code == 200
@@ -643,13 +598,13 @@ async def test_summarize_endpoint_skips_without_shared_model(test_env) -> None:
     resp = await test_env["client"].post(
         "/v1/sessions",
         json={"title": "no model"},
-        headers={"Authorization": f"Bearer {test_env['token_a']}"},
+        headers={"X-User-Id": "alice"},
     )
     session_id = resp.json()["session_id"]
 
     resp = await test_env["client"].post(
         f"/v1/sessions/{session_id}/summarize",
-        headers={"Authorization": f"Bearer {test_env['token_a']}"},
+        headers={"X-User-Id": "alice"},
     )
 
     assert resp.status_code == 200
@@ -663,7 +618,7 @@ async def test_summarize_endpoint_skips_without_substantive_content(
 ) -> None:
     agent = _FakeAgent()
     model = _FakeSummarizingModel()
-    app, cache, token = await _make_app_env(
+    app, cache = await _make_app_env(
         tmp_path, monkeypatch, agent=agent, shared_model=model
     )
 
@@ -675,13 +630,13 @@ async def test_summarize_endpoint_skips_without_substantive_content(
             resp = await client.post(
                 "/v1/sessions",
                 json={"title": "empty"},
-                headers={"Authorization": f"Bearer {token}"},
+                headers={"X-User-Id": "alice"},
             )
             session_id = resp.json()["session_id"]
 
             resp = await client.post(
                 f"/v1/sessions/{session_id}/summarize",
-                headers={"Authorization": f"Bearer {token}"},
+                headers={"X-User-Id": "alice"},
             )
 
     assert resp.status_code == 200
@@ -695,7 +650,7 @@ async def test_summarize_endpoint_skips_when_model_raises(tmp_path, monkeypatch)
     agent = _FakeAgent(
         state_messages=[_FakeMsg("human", "hi"), _FakeMsg("ai", "hello")]
     )
-    app, cache, token = await _make_app_env(
+    app, cache = await _make_app_env(
         tmp_path, monkeypatch, agent=agent, shared_model=_FailingSummarizingModel()
     )
 
@@ -707,13 +662,13 @@ async def test_summarize_endpoint_skips_when_model_raises(tmp_path, monkeypatch)
             resp = await client.post(
                 "/v1/sessions",
                 json={"title": "boom"},
-                headers={"Authorization": f"Bearer {token}"},
+                headers={"X-User-Id": "alice"},
             )
             session_id = resp.json()["session_id"]
 
             resp = await client.post(
                 f"/v1/sessions/{session_id}/summarize",
-                headers={"Authorization": f"Bearer {token}"},
+                headers={"X-User-Id": "alice"},
             )
 
     assert resp.status_code == 200
@@ -726,13 +681,13 @@ async def test_summarize_endpoint_404_on_foreign_session(test_env) -> None:
     resp = await test_env["client"].post(
         "/v1/sessions",
         json={"title": "alice's"},
-        headers={"Authorization": f"Bearer {test_env['token_a']}"},
+        headers={"X-User-Id": "alice"},
     )
     session_id = resp.json()["session_id"]
 
     resp = await test_env["client"].post(
         f"/v1/sessions/{session_id}/summarize",
-        headers={"Authorization": f"Bearer {test_env['token_b']}"},
+        headers={"X-User-Id": "bob"},
     )
     assert resp.status_code == 404
 
@@ -743,7 +698,7 @@ async def test_delete_session_does_not_write_memory_note(tmp_path, monkeypatch) 
         state_messages=[_FakeMsg("human", "hi"), _FakeMsg("ai", "hello")]
     )
     model = _FakeSummarizingModel()
-    app, cache, token = await _make_app_env(
+    app, cache = await _make_app_env(
         tmp_path, monkeypatch, agent=agent, shared_model=model
     )
 
@@ -755,13 +710,13 @@ async def test_delete_session_does_not_write_memory_note(tmp_path, monkeypatch) 
             resp = await client.post(
                 "/v1/sessions",
                 json={"title": "to delete"},
-                headers={"Authorization": f"Bearer {token}"},
+                headers={"X-User-Id": "alice"},
             )
             session_id = resp.json()["session_id"]
 
             resp = await client.delete(
                 f"/v1/sessions/{session_id}",
-                headers={"Authorization": f"Bearer {token}"},
+                headers={"X-User-Id": "alice"},
             )
 
     assert resp.status_code == 200

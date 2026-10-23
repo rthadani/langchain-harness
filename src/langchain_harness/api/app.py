@@ -148,7 +148,7 @@ async def lifespan(app: FastAPI):
     app.state.agent_cache = cache
     app.state.get_agent = cache.get_agent
 
-    app.state.auth = build_auth(config.server, store)
+    app.state.auth = build_auth(config.server)
     logger.info(
         "Auth modes (in precedence order): %s", ", ".join(app.state.auth.modes)
     )

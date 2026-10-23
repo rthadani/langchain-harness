@@ -1,13 +1,12 @@
-"""Server persistence: API users, session metadata, and agent checkpoints.
+"""Server persistence: session metadata and agent checkpoints.
 
 Two interchangeable backends:
 
 - ``SqliteStore`` (default) keeps the existing on-disk layout:
-  ``<cwd>/.harness/server.db`` for users and
   ``<cwd>/.harness/users/<user_id>/sessions.db`` for sessions + checkpoints.
-- ``PostgresStore`` stores all three in one Postgres database. Select it with
-  ``HARNESS_DATABASE_URL``. It is the only backend that works across multiple
-  replicas, because every pod sees the same users and session state.
+- ``PostgresStore`` stores sessions and LangGraph checkpoints in one Postgres
+  database. Select it with ``HARNESS_DATABASE_URL``. It is the only backend
+  that works across multiple replicas.
 
 Workspace files are still per-pod; sharing them needs a ReadWriteMany volume.
 """
@@ -16,7 +15,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -24,7 +22,7 @@ from typing import Any, Protocol
 
 import aiosqlite
 
-from langchain_harness import serverdb, sessions
+from langchain_harness import sessions
 from langchain_harness.workspaces import user_sessions_db
 
 _DEFAULT_POOL_SIZE = 10
@@ -34,17 +32,6 @@ _DEFAULT_POOL_SIZE = 10
 _PG_INIT_LOCK = 0x6861726E
 
 _PG_SCHEMA = (
-    """
-    CREATE TABLE IF NOT EXISTS users (
-        user_id TEXT PRIMARY KEY,
-        username TEXT UNIQUE NOT NULL,
-        token_hash TEXT NOT NULL,
-        created_at TEXT NOT NULL,
-        is_active BOOLEAN NOT NULL DEFAULT TRUE,
-        auth_source TEXT NOT NULL DEFAULT ''
-    )
-    """,
-    "ALTER TABLE users ADD COLUMN IF NOT EXISTS auth_source TEXT NOT NULL DEFAULT ''",
     """
     CREATE TABLE IF NOT EXISTS sessions (
         thread_id TEXT PRIMARY KEY,
@@ -71,26 +58,6 @@ class Store(Protocol):
     async def ping(self) -> None: ...
 
     def describe(self) -> str: ...
-
-    async def add_user(self, username: str) -> str: ...
-
-    async def get_or_create_user(
-        self, user_id: str, *, source: str = ""
-    ) -> dict[str, Any]: ...
-
-    async def get_user_by_username(
-        self, username: str
-    ) -> dict[str, Any] | None: ...
-
-    async def count_provisioned_users(self) -> int: ...
-
-    async def list_users(self) -> list[dict[str, Any]]: ...
-
-    async def revoke_user(self, username: str) -> bool: ...
-
-    async def get_user_by_token_hash(
-        self, token_hash: str
-    ) -> dict[str, Any] | None: ...
 
     async def create_session(
         self, user_id: str, thread_id: str, title: str | None
@@ -122,75 +89,16 @@ class SqliteStore:
         self.cwd = cwd
 
     def describe(self) -> str:
-        return str(serverdb.server_db_path(self.cwd))
+        return str(self.cwd / ".harness")
 
     async def initialize(self) -> None:
-        path = serverdb.server_db_path(self.cwd)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        async with aiosqlite.connect(str(path)) as conn:
-            await serverdb.init_server_db(conn)
+        return None
 
     async def close(self) -> None:
         return None
 
     async def ping(self) -> None:
-        path = serverdb.server_db_path(self.cwd)
-        async with aiosqlite.connect(str(path)) as conn:
-            await conn.execute("SELECT 1")
-
-    async def add_user(self, username: str) -> str:
-        path = serverdb.server_db_path(self.cwd)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        async with aiosqlite.connect(str(path)) as conn:
-            await serverdb.init_server_db(conn)
-            return await serverdb.add_user(conn, username)
-
-    async def list_users(self) -> list[dict[str, Any]]:
-        path = serverdb.server_db_path(self.cwd)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        async with aiosqlite.connect(str(path)) as conn:
-            await serverdb.init_server_db(conn)
-            return await serverdb.list_users(conn)
-
-    async def revoke_user(self, username: str) -> bool:
-        path = serverdb.server_db_path(self.cwd)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        async with aiosqlite.connect(str(path)) as conn:
-            await serverdb.init_server_db(conn)
-            return await serverdb.revoke_user(conn, username)
-
-    async def get_user_by_token_hash(
-        self, token_hash: str
-    ) -> dict[str, Any] | None:
-        path = serverdb.server_db_path(self.cwd)
-        async with aiosqlite.connect(str(path)) as conn:
-            await serverdb.init_server_db(conn)
-            return await serverdb.lookup_by_token_hash(conn, token_hash)
-
-    async def get_or_create_user(
-        self, user_id: str, *, source: str = ""
-    ) -> dict[str, Any]:
-        path = serverdb.server_db_path(self.cwd)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        async with aiosqlite.connect(str(path)) as conn:
-            await serverdb.init_server_db(conn)
-            return await serverdb.get_or_create_user(conn, user_id, source=source)
-
-    async def get_user_by_username(
-        self, username: str
-    ) -> dict[str, Any] | None:
-        path = serverdb.server_db_path(self.cwd)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        async with aiosqlite.connect(str(path)) as conn:
-            await serverdb.init_server_db(conn)
-            return await serverdb.get_user_by_username(conn, username)
-
-    async def count_provisioned_users(self) -> int:
-        path = serverdb.server_db_path(self.cwd)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        async with aiosqlite.connect(str(path)) as conn:
-            await serverdb.init_server_db(conn)
-            return await serverdb.count_provisioned_users(conn)
+        return None
 
     def _session_db(self, user_id: str) -> Path:
         path = user_sessions_db(self.cwd, user_id)
@@ -217,7 +125,7 @@ class SqliteStore:
     async def list_sessions(
         self, user_id: str, *, limit: int = 20
     ) -> list[dict[str, Any]]:
-        path = user_sessions_db(self.cwd, user_id)
+        path = self._session_db(user_id)
         if not path.exists():
             return []
         async with sessions.connect(path) as conn:
@@ -226,14 +134,14 @@ class SqliteStore:
     async def get_session(
         self, user_id: str, thread_id: str
     ) -> dict[str, Any] | None:
-        path = user_sessions_db(self.cwd, user_id)
+        path = self._session_db(user_id)
         if not path.exists():
             return None
         async with sessions.connect(path) as conn:
             return await sessions.get_session(conn, thread_id, user_id=user_id)
 
     async def delete_session(self, user_id: str, thread_id: str) -> None:
-        path = user_sessions_db(self.cwd, user_id)
+        path = self._session_db(user_id)
         if not path.exists():
             return
         async with sessions.connect(path) as conn:
@@ -358,149 +266,6 @@ class PostgresStore:
     async def ping(self) -> None:
         async with self._require_pool().connection() as conn:
             await conn.execute("SELECT 1")
-
-    async def add_user(self, username: str) -> str:
-        from psycopg.errors import UniqueViolation
-
-        user_id = uuid.uuid4().hex
-        token = serverdb.generate_token()
-        try:
-            async with self._require_pool().connection() as conn:
-                await conn.execute(
-                    "INSERT INTO users "
-                    "(user_id, username, token_hash, created_at, is_active, "
-                    "auth_source) "
-                    "VALUES (%s, %s, %s, %s, TRUE, 'token')",
-                    (
-                        user_id,
-                        username,
-                        serverdb.hash_token(token),
-                        sessions.now_iso(),
-                    ),
-                )
-        except UniqueViolation as exc:
-            raise ValueError(f"User {username!r} already exists") from exc
-        return token
-
-    async def get_or_create_user(
-        self, user_id: str, *, source: str = ""
-    ) -> dict[str, Any]:
-        """Return the user row for *user_id*, inserting it on first sight.
-
-        ``ON CONFLICT DO NOTHING`` covers both the user_id primary key and the
-        username unique constraint, so racing replicas converge on one row.
-        A username is reused only when the existing row's effective source
-        matches *source*; otherwise ``UserIdConflict`` is raised.
-        """
-        columns = (
-            "SELECT user_id, username, is_active, auth_source "
-            "FROM users WHERE "
-        )
-        async with self._require_pool().connection() as conn:
-            cur = await conn.execute(columns + "username = %s", (user_id,))
-            row = await cur.fetchone()
-            if row is None:
-                await conn.execute(
-                    "INSERT INTO users "
-                    "(user_id, username, token_hash, created_at, is_active, "
-                    "auth_source) "
-                    "VALUES (%s, %s, '', %s, TRUE, %s) "
-                    "ON CONFLICT DO NOTHING",
-                    (user_id, user_id, sessions.now_iso(), source),
-                )
-                cur = await conn.execute(columns + "username = %s", (user_id,))
-                row = await cur.fetchone()
-        if row is None:  # pragma: no cover - insert just wrote it
-            raise RuntimeError(f"user {user_id!r} could not be created")
-        effective_source = row[3] or "token"
-        if effective_source != source:
-            raise serverdb.UserIdConflict(user_id)
-        return {
-            "user_id": row[0],
-            "username": row[1],
-            "is_active": bool(row[2]),
-            "auth_source": row[3],
-        }
-
-    async def get_user_by_username(
-        self, username: str
-    ) -> dict[str, Any] | None:
-        async with self._require_pool().connection() as conn:
-            cur = await conn.execute(
-                "SELECT user_id, username, is_active, auth_source "
-                "FROM users WHERE username = %s",
-                (username,),
-            )
-            row = await cur.fetchone()
-        if row is None:
-            return None
-        return {
-            "user_id": row[0],
-            "username": row[1],
-            "is_active": bool(row[2]),
-            "auth_source": row[3],
-        }
-
-    async def count_provisioned_users(self) -> int:
-        async with self._require_pool().connection() as conn:
-            cur = await conn.execute(
-                "SELECT COUNT(*) FROM users "
-                "WHERE auth_source IS NOT NULL "
-                "AND auth_source != '' "
-                "AND auth_source != 'token'"
-            )
-            row = await cur.fetchone()
-        return row[0]
-
-    async def list_users(self) -> list[dict[str, Any]]:
-        from psycopg.rows import dict_row
-
-        async with self._require_pool().connection() as conn:
-            async with conn.cursor(row_factory=dict_row) as cur:
-                await cur.execute(
-                    "SELECT user_id, username, created_at, is_active, auth_source "
-                    "FROM users ORDER BY created_at"
-                )
-                rows = await cur.fetchall()
-        return [
-            {
-                "user_id": row["user_id"],
-                "username": row["username"],
-                "created_at": row["created_at"],
-                "is_active": bool(row["is_active"]),
-                "auth_source": row["auth_source"],
-            }
-            for row in rows
-        ]
-
-    async def revoke_user(self, username: str) -> bool:
-        async with self._require_pool().connection() as conn:
-            cur = await conn.execute(
-                "UPDATE users SET is_active = FALSE WHERE username = %s",
-                (username,),
-            )
-            return cur.rowcount > 0
-
-    async def get_user_by_token_hash(
-        self, token_hash: str
-    ) -> dict[str, Any] | None:
-        from psycopg.rows import dict_row
-
-        async with self._require_pool().connection() as conn:
-            async with conn.cursor(row_factory=dict_row) as cur:
-                await cur.execute(
-                    "SELECT user_id, username, is_active FROM users "
-                    "WHERE token_hash = %s",
-                    (token_hash,),
-                )
-                row = await cur.fetchone()
-        if row is None:
-            return None
-        return {
-            "user_id": row["user_id"],
-            "username": row["username"],
-            "is_active": bool(row["is_active"]),
-        }
 
     async def create_session(
         self, user_id: str, thread_id: str, title: str | None

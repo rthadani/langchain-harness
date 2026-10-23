@@ -20,7 +20,6 @@ import pytest
 from langchain_harness.api.app import create_app
 from langchain_harness.api.sse import stream_sse_response
 from langchain_harness.config import Config
-from langchain_harness.serverdb import add_user, init_server_db, server_db_path
 
 
 class _Chunk:
@@ -33,8 +32,13 @@ class _SlowAgent:
 
     def __init__(self) -> None:
         self.was_cancelled = False
+        # Set when the generator body actually starts running. A fixed sleep is
+        # not enough: on a loaded event loop the consumer can be cancelled
+        # before this generator is ever entered, so the run asserts nothing.
+        self.entered = asyncio.Event()
 
     async def astream_events(self, input_data: Any, config: Any, *, version: str):
+        self.entered.set()
         try:
             for i in range(10000):
                 await asyncio.sleep(0.001)
@@ -42,7 +46,10 @@ class _SlowAgent:
                     "event": "on_chat_model_stream",
                     "data": {"chunk": _Chunk(f"chunk-{i}")},
                 }
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, GeneratorExit):
+            # Either path means streaming stopped because the consumer went
+            # away; which one lands first depends on where the generator was
+            # suspended.
             self.was_cancelled = True
             raise
 
@@ -88,8 +95,8 @@ async def test_disconnect_cancels_streaming(tmp_path, monkeypatch) -> None:
             pass
 
     task = asyncio.create_task(_consume())
-    # Let the agent enter its streaming loop
-    await asyncio.sleep(0.05)
+    # Wait until the agent is inside its streaming loop, instead of guessing.
+    await asyncio.wait_for(slow_agent.entered.wait(), timeout=10)
     task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await task
@@ -102,15 +109,6 @@ async def test_disconnect_cancels_streaming(tmp_path, monkeypatch) -> None:
 async def test_streaming_completes_normally(tmp_path, monkeypatch) -> None:
     """Verify that a normal (non-cancelled) stream completes with done event."""
     monkeypatch.chdir(tmp_path)
-
-    import aiosqlite
-
-    db_path = server_db_path(tmp_path)
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-
-    async with aiosqlite.connect(str(db_path)) as conn:
-        await init_server_db(conn)
-        token = await add_user(conn, "alice")
 
     config = Config(provider="anthropic", model="test-model")
     app = create_app(tmp_path, config)
@@ -135,14 +133,14 @@ async def test_streaming_completes_normally(tmp_path, monkeypatch) -> None:
             resp = await client.post(
                 "/v1/sessions",
                 json={"title": "test"},
-                headers={"Authorization": f"Bearer {token}"},
+                headers={"X-User-Id": "alice"},
             )
             session_id = resp.json()["session_id"]
 
             resp = await client.post(
                 f"/v1/sessions/{session_id}/messages",
                 json={"content": "hello"},
-                headers={"Authorization": f"Bearer {token}"},
+                headers={"X-User-Id": "alice"},
             )
             assert resp.status_code == 200
             body = resp.text

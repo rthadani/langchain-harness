@@ -45,7 +45,7 @@ class CompactionConfig:
 
 # Auth modes the server knows how to build. Order in ``auth_modes`` is the
 # order they are tried; the first one holding a credential for the request wins.
-KNOWN_AUTH_MODES = ("token", "trust", "jwt")
+KNOWN_AUTH_MODES = ("trust", "jwt")
 
 # Asymmetric JWT algorithms only. HMAC (HS*) and 'none' are forbidden because
 # the verifier uses the issuer's public JWKS: an attacker who can ask for a
@@ -81,9 +81,8 @@ class ServerConfig:
     host: str = "127.0.0.1"
     port: int = 8000
     enable_shell: bool = False
-    auth_modes: tuple[str, ...] = ("token",)
+    auth_modes: tuple[str, ...] = ("trust",)
     jwt: JwtConfig = field(default_factory=JwtConfig)
-    max_auto_provisioned_users: int = 500
 
 
 @dataclass(frozen=True)
@@ -223,16 +222,6 @@ def _parse_float(value: Any) -> float | None:
     return parsed if parsed >= 0 else None
 
 
-def _parse_max_auto_provisioned(value: Any) -> int | None:
-    """Parse max_auto_provisioned_users; any integer is valid (<=0 is unlimited)."""
-    if value is None:
-        return None
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None
-
-
 def _resolve_jwt(toml_data: dict[str, Any]) -> JwtConfig:
     """Build a ``JwtConfig`` from the ``[server.jwt]`` TOML section."""
     server_section = toml_data.get("server", {})
@@ -310,7 +299,7 @@ def _resolve_auth_modes(toml_data: dict[str, Any]) -> tuple[tuple[str, ...], Jwt
         os.environ.get("HARNESS_SERVER_AUTH_MODES")
         or server_section.get("auth_modes")
     )
-    modes = tuple(mode.lower() for mode in modes_raw) if modes_raw else ("token",)
+    modes = tuple(mode.lower() for mode in modes_raw) if modes_raw else ("trust",)
 
     unknown = [mode for mode in modes if mode not in KNOWN_AUTH_MODES]
     if unknown:
@@ -365,25 +354,12 @@ def _resolve_server(toml_data: dict[str, Any]) -> ServerConfig:
 
     auth_modes, jwt = _resolve_auth_modes(toml_data)
 
-    max_auto_env = _parse_max_auto_provisioned(
-        os.environ.get("HARNESS_SERVER_MAX_AUTO_PROVISIONED_USERS")
-    )
-    max_auto_toml = _parse_max_auto_provisioned(
-        toml_section.get("max_auto_provisioned_users")
-    )
-    max_auto_provisioned_users = (
-        max_auto_env
-        if max_auto_env is not None
-        else (max_auto_toml if max_auto_toml is not None else 500)
-    )
-
     return ServerConfig(
         host=host,
         port=port,
         enable_shell=enable_shell,
         auth_modes=auth_modes,
         jwt=jwt,
-        max_auto_provisioned_users=max_auto_provisioned_users,
     )
 
 

@@ -38,15 +38,15 @@ Resolution order: **environment variables > CLI flags > `harness.toml`**.
 - `HARNESS_BASE_URL` — custom base URL for OpenAI-compatible endpoints.
 - `HARNESS_API_KEY` — explicit API key.
 - `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` — used as API-key fallbacks.
-- `HARNESS_DATABASE_URL` — Postgres DSN for server/user/session storage. When
-  unset the server uses SQLite under `<cwd>/.harness`. Applies to `serve`,
-  `users`, and `db init`; local `run`/`sessions`/`memory` still use SQLite.
+- `HARNESS_DATABASE_URL` — Postgres DSN for server/session storage. When
+  unset the server uses SQLite under `<cwd>/.harness`. Applies to `serve` and
+  `db init`; local `run`/`sessions`/`memory` still use SQLite.
 - `HARNESS_DATABASE_POOL_SIZE` — Postgres connection pool size (default 10).
 
 ### CLI flags
 
 - `--provider`, `--model`, `--base-url`, `--api-key`
-- `--workspace <path>` — working folder to run in (equivalent to `cd <path> && harness`). Discovery, `harness.toml`, `sessions.db`, and the agent backend all follow it. A relative path resolves against the current directory, and `~` expands. Applies to `run`, `sessions`, and `memory` only (not `serve` or `users`).
+- `--workspace <path>` — working folder to run in (equivalent to `cd <path> && harness`). Discovery, `harness.toml`, `sessions.db`, and the agent backend all follow it. A relative path resolves against the current directory, and `~` expands. Applies to `run`, `sessions`, and `memory` only (not `serve`).
 
 ### `harness.toml`
 
@@ -164,16 +164,6 @@ The harness can run as a multi-user web API server with per-user workspace isola
 # HARNESS_DATABASE_URL is set, otherwise SQLite)
 uv run harness db init
 
-# add two users (tokens are printed once)
-uv run harness users add alice
-uv run harness users add bob
-
-# list users
-uv run harness users list
-
-# revoke a user
-uv run harness users revoke alice
-
 # start the server
 HARNESS_PROVIDER=anthropic HARNESS_MODEL=claude-3-5-sonnet-latest HARNESS_API_KEY=... uv run harness serve
 ```
@@ -229,44 +219,26 @@ Add a `[server]` section to `harness.toml`:
 host = "127.0.0.1"
 port = 8000
 enable_shell = false
-auth_modes = ["token"]  # default
+auth_modes = ["trust"]  # default
 ```
 
 Env overrides: `HARNESS_SERVER_HOST`, `HARNESS_SERVER_PORT`, `HARNESS_SERVER_ENABLE_SHELL`, `HARNESS_SERVER_AUTH_MODES`.
 
 ### Auth
 
-The server supports three auth modes, listed in precedence order under `[server] auth_modes`. The first mode that recognizes the request wins.
+The server supports two auth modes, listed in precedence order under `[server] auth_modes`. The first mode that recognizes the request wins.
 
 ```toml
 [server]
-auth_modes = ["token"]  # default
+auth_modes = ["trust"]  # default
 ```
 
 Modes:
 
-- `token` (default): `Authorization: Bearer harn_...` against the `users` table. Users are created ahead of time with `harness users add`.
-- `jwt`: `Authorization: Bearer <JWT>` verified against the issuer's JWKS via OIDC discovery. Users are created on first valid token. Requires the `jwt` extra: `pip install 'langchain-harness[jwt]'` (or `uv add --extra jwt`).
-- `trust`: `X-User-Id: <id>` believed as-is. Users are created on first request.
+- `trust` (default): `X-User-Id: <id>` believed as-is. Identity comes entirely from the request header; nothing is persisted about users.
+- `jwt`: `Authorization: Bearer <JWT>` verified against the issuer's JWKS via OIDC discovery. The user id is taken from the configured claim. Requires the `jwt` extra: `pip install 'langchain-harness[jwt]'` (or `uv add --extra jwt`).
 
-Tokens are `harn_` + 32 bytes of URL-safe randomness, stored as SHA-256 hashes in a global `server.db` (separate from any user's session database). The plaintext token is shown only once at creation time.
-
-Trust and JWT users are auto-provisioned on first successful authentication. The `users.auth_source` column records how a user was created (`token`, `trust`, or `jwt`), and `harness users list` shows `via=<source>`.
-
-A user id that already exists under one source cannot be claimed from a different source. For example, if `alice` was provisioned as a token user, a request presenting `X-User-Id: alice` in `trust` mode or a JWT `sub: alice` will be rejected with `409 Conflict` rather than inheriting the existing user's workspace and sessions.
-
-**Warning:** `trust` mode is only safe behind an authenticating gateway. Anyone who can reach the server's port can claim any user id by sending the `X-User-Id` header, read that user's workspace and sessions, and allocate new workspaces without limit.
-
-#### Auto-provisioning cap
-
-To prevent unbounded user creation in `trust` or `jwt` mode, set a cap:
-
-```toml
-[server]
-max_auto_provisioned_users = 500  # default; <=0 is unlimited
-```
-
-Env override: `HARNESS_SERVER_MAX_AUTO_PROVISIONED_USERS`. Once the cap is reached, new auto-provisioned requests receive `429 Too Many Requests`; existing users continue to authenticate normally.
+**Warning:** `trust` mode is only safe behind an authenticating gateway. Anyone who can reach the server's port can claim any user id by sending the `X-User-Id` header, read that user's workspace and sessions, and allocate new workspaces without limit. There is no revocation, no provisioning cap, and no source ownership: identity comes from the header or the JWT claim only, and nothing is persisted about users.
 
 #### JWT configuration
 
@@ -274,7 +246,7 @@ When `auth_modes` includes `jwt`, configure verification in `[server.jwt]`:
 
 ```toml
 [server]
-auth_modes = ["jwt", "token"]
+auth_modes = ["jwt"]
 
 [server.jwt]
 issuer = "https://accounts.example.com"
@@ -312,10 +284,10 @@ needs a ReadWriteOnce volume and `strategy: Recreate`. Do not put that volume
 on GCS FUSE.
 
 To run multiple replicas, set `HARNESS_DATABASE_URL` to a Postgres database.
-Users, sessions, and LangGraph checkpoints are then shared. The remaining
-constraint is workspace files under `users/<id>/workspace/`; to scale past one
-replica you must still share those with a ReadWriteMany volume or equivalent
-shared filesystem. Reference manifests are in `deploy/README.md`.
+Sessions and LangGraph checkpoints are then shared. The remaining constraint
+is workspace files under `users/<id>/workspace/`; to scale past one replica you
+must still share those with a ReadWriteMany volume or equivalent shared
+filesystem. Reference manifests are in `deploy/README.md`.
 
 ## Important risks and limitations
 
