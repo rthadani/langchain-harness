@@ -6,7 +6,15 @@ from pathlib import Path
 
 import pytest
 
+from langchain_harness.published import (
+    create_draft,
+    delete_published,
+    publish,
+    published_dir,
+)
 from langchain_harness.workspaces import (
+    GLOBAL_SKILLS_VPATH,
+    USER_SKILLS_VPATH,
     get_workspace_memory_paths,
     get_workspace_skills_dir,
     provision_user_workspace,
@@ -14,6 +22,8 @@ from langchain_harness.workspaces import (
     user_sessions_db,
     user_workspace,
     users_root,
+    workspace_memory_sources,
+    workspace_skill_sources,
 )
 
 
@@ -151,3 +161,104 @@ def test_provision_does_not_copy_guardrails(tmp_path: Path) -> None:
     workspace = provision_user_workspace(tmp_path, "u123")
 
     assert not (workspace / "GUARDRAILS.md").exists()
+
+
+# --- backend skill sources ---
+
+
+def test_workspace_skill_sources_user_first_then_global(tmp_path: Path) -> None:
+    """User sources come first because the skills middleware lets later win."""
+    workspace = tmp_path / "workspace"
+    (workspace / ".claude" / "skills").mkdir(parents=True)
+    (workspace / ".claude" / "user-skills").mkdir(parents=True)
+
+    assert workspace_skill_sources(workspace) == [
+        USER_SKILLS_VPATH,
+        GLOBAL_SKILLS_VPATH,
+    ]
+
+
+def test_workspace_skill_sources_omits_missing_dirs(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    assert workspace_skill_sources(workspace) == []
+
+    (workspace / ".claude" / "user-skills").mkdir(parents=True)
+    assert workspace_skill_sources(workspace) == [USER_SKILLS_VPATH]
+
+
+# --- backend memory sources ---
+
+
+def test_workspace_memory_sources_returns_virtual_paths(tmp_path: Path) -> None:
+    """Sources are virtual paths so a virtual-mode backend can resolve them."""
+    workspace = tmp_path / "workspace"
+    (workspace / ".harness" / "memory").mkdir(parents=True)
+    (workspace / "CLAUDE.md").write_text("# Claude", encoding="utf-8")
+    (workspace / "AGENTS.md").write_text("# Agents", encoding="utf-8")
+    (workspace / ".harness" / "memory" / "notes.md").write_text(
+        "# Notes", encoding="utf-8"
+    )
+
+    assert workspace_memory_sources(workspace) == [
+        "/CLAUDE.md",
+        "/AGENTS.md",
+        "/.harness/memory/notes.md",
+    ]
+
+
+def test_workspace_memory_sources_skips_missing_files(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    assert workspace_memory_sources(workspace) == []
+
+    (workspace / "CLAUDE.md").write_text("# Claude", encoding="utf-8")
+    assert workspace_memory_sources(workspace) == ["/CLAUDE.md"]
+
+
+# --- published copies ---
+
+
+def _publish_skill(tmp_path: Path, user_id: str, name: str) -> None:
+    workspace = user_workspace(tmp_path, user_id)
+    workspace.mkdir(parents=True, exist_ok=True)
+    draft = create_draft(
+        user_id,
+        workspace,
+        kind="skills",
+        name=name,
+        description=f"{name} skill",
+        body=f"# {name}",
+    )
+    publish(tmp_path, user_id, workspace, draft["draft_id"])
+
+
+def test_provision_copies_published_skills(tmp_path: Path) -> None:
+    _publish_skill(tmp_path, "u123", "mine")
+
+    workspace = provision_user_workspace(tmp_path, "u123")
+
+    copied = workspace / ".claude" / "user-skills" / "mine" / "SKILL.md"
+    assert copied.is_file()
+    assert "name: mine" in copied.read_text(encoding="utf-8")
+
+
+def test_provision_does_not_delete_published_store(tmp_path: Path) -> None:
+    _publish_skill(tmp_path, "u123", "mine")
+
+    provision_user_workspace(tmp_path, "u123")
+    provision_user_workspace(tmp_path, "u123")
+
+    assert (published_dir(tmp_path, "u123", "skills") / "mine" / "SKILL.md").is_file()
+
+
+def test_provision_removes_copy_after_delete(tmp_path: Path) -> None:
+    _publish_skill(tmp_path, "u123", "mine")
+    workspace = provision_user_workspace(tmp_path, "u123")
+    assert (workspace / ".claude" / "user-skills" / "mine").is_dir()
+
+    delete_published(tmp_path, "u123", "skills", "mine")
+    provision_user_workspace(tmp_path, "u123")
+
+    assert not (workspace / ".claude" / "user-skills" / "mine").exists()

@@ -399,6 +399,34 @@ async def test_build_agent_truthy_skills_override_passed_through(
 
 
 @pytest.mark.asyncio
+async def test_build_agent_memory_override_passes_virtual_paths_through(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Memory overrides are backend paths and must not be filtered by host
+    existence: ``/CLAUDE.md`` is virtual and does not exist on the host."""
+    captured: dict[str, Any] = {}
+
+    def fake_create_deep_agent(**kwargs: Any) -> object:
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(
+        "langchain_harness.agent_builder.create_deep_agent", fake_create_deep_agent
+    )
+
+    config = Config(provider="anthropic", model="claude-3")
+    await build_agent(
+        config,
+        tmp_path,
+        checkpointer=object(),
+        skills_override=[],
+        memory_override=["/CLAUDE.md"],
+    )
+
+    assert captured["memory"] == ["/CLAUDE.md"]
+
+
+@pytest.mark.asyncio
 async def test_build_agent_model_override_used_while_defaults_load(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -439,3 +467,191 @@ async def test_build_agent_model_override_used_while_defaults_load(
     assert captured["tools"] is None
     # backend was built via _build_backend (not None)
     assert captured["backend"] is not None
+
+
+# --- subagent name collisions ---
+
+
+def _write_agent_file(path: Path, name: str, body: str) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        f"---\nname: {name}\ndescription: d\n---\n{body}", encoding="utf-8"
+    )
+    return path
+
+
+def test_load_subagents_first_wins_on_duplicate_name(tmp_path: Path, caplog) -> None:
+    """Global files are listed first, so the first definition of a name wins."""
+    global_path = _write_agent_file(
+        tmp_path / ".claude" / "agents" / "shared.md", "shared", "global body"
+    )
+    user_path = _write_agent_file(
+        tmp_path / ".claude" / "user-agents" / "shared.md", "shared", "user body"
+    )
+
+    with caplog.at_level("WARNING"):
+        subagents, sources = _load_subagents([global_path, user_path], "anthropic")
+
+    assert len(subagents) == 1
+    assert subagents[0]["system_prompt"].strip() == "global body"
+    assert sources == {"shared": global_path}
+    assert "already defined" in caplog.text
+
+
+# --- real backend skill loading (virtual-path regression) ---
+
+
+@pytest.mark.asyncio
+async def test_build_agent_skills_are_visible_through_real_backend(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Workspace skill sources must load through a real FilesystemBackend.
+
+    Passing host absolute paths as skill sources resolves them under the
+    backend root in virtual mode and returns no skills; the virtual paths from
+    ``workspace_skill_sources`` are what make server-mode skills visible.
+    """
+    from deepagents.backends import FilesystemBackend
+    from deepagents.middleware.skills import _list_skills
+
+    from langchain_harness.workspaces import (
+        GLOBAL_SKILLS_VPATH,
+        USER_SKILLS_VPATH,
+        workspace_skill_sources,
+    )
+
+    workspace = tmp_path / "workspace"
+    for source, name in (
+        (".claude/skills", "demo"),
+        (".claude/user-skills", "mine"),
+    ):
+        skill_dir = workspace / source / name
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            f"---\nname: {name}\ndescription: {name} skill\n---\nbody",
+            encoding="utf-8",
+        )
+
+    captured: dict[str, Any] = {}
+
+    def fake_create_deep_agent(**kwargs: Any) -> object:
+        captured.update(kwargs)
+        return kwargs
+
+    monkeypatch.setattr(
+        "langchain_harness.agent_builder.create_deep_agent", fake_create_deep_agent
+    )
+
+    backend = FilesystemBackend(root_dir=workspace)
+    config = Config(provider="anthropic", model="claude-3")
+    await build_agent(
+        config,
+        tmp_path,
+        checkpointer=object(),
+        enable_shell=False,
+        root_dir=workspace,
+        skills_override=workspace_skill_sources(workspace),
+        memory_override=[],
+        tools_override=[],
+        backend=backend,
+    )
+
+    sources = captured["skills"]
+    assert sources == [USER_SKILLS_VPATH, GLOBAL_SKILLS_VPATH]
+    assert [skill["name"] for skill in _list_skills(backend, sources[0])] == ["mine"]
+    assert [skill["name"] for skill in _list_skills(backend, sources[1])] == ["demo"]
+
+
+@pytest.mark.asyncio
+async def test_workspace_memory_sources_load_through_real_backend(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Workspace memory sources must load through a real FilesystemBackend.
+
+    ``MemoryMiddleware`` reads sources with ``download_files``; host absolute
+    paths resolve under the backend root in virtual mode and miss, so only the
+    virtual paths from ``workspace_memory_sources`` are loadable.
+    """
+    from deepagents.backends import FilesystemBackend
+
+    from langchain_harness.workspaces import workspace_memory_sources
+
+    workspace = tmp_path / "workspace"
+    (workspace / ".harness" / "memory").mkdir(parents=True)
+    (workspace / "CLAUDE.md").write_text("# Claude", encoding="utf-8")
+    (workspace / "AGENTS.md").write_text("# Agents", encoding="utf-8")
+    (workspace / ".harness" / "memory" / "notes.md").write_text(
+        "# Notes", encoding="utf-8"
+    )
+
+    captured: dict[str, Any] = {}
+
+    def fake_create_deep_agent(**kwargs: Any) -> object:
+        captured.update(kwargs)
+        return kwargs
+
+    monkeypatch.setattr(
+        "langchain_harness.agent_builder.create_deep_agent", fake_create_deep_agent
+    )
+
+    backend = FilesystemBackend(root_dir=workspace)
+    await build_agent(
+        Config(provider="anthropic", model="claude-3"),
+        tmp_path,
+        checkpointer=object(),
+        enable_shell=False,
+        root_dir=workspace,
+        skills_override=[],
+        memory_override=workspace_memory_sources(workspace),
+        tools_override=[],
+        backend=backend,
+    )
+
+    sources = captured["memory"]
+    assert sources == ["/CLAUDE.md", "/AGENTS.md", "/.harness/memory/notes.md"]
+    assert [response.error for response in backend.download_files(sources)] == [
+        None,
+        None,
+        None,
+    ]
+    # The host form resolves under the root and is unreachable, which is the bug.
+    host_form = backend.download_files([str(workspace / "CLAUDE.md")])
+    assert host_form[0].error is not None
+
+
+@pytest.mark.asyncio
+async def test_build_agent_agents_override_replaces_discovery(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """An explicit agents_override skips discovery of ``.claude/agents``."""
+    captured: dict[str, Any] = {}
+
+    def fake_create_deep_agent(**kwargs: Any) -> object:
+        captured.update(kwargs)
+        return kwargs
+
+    monkeypatch.setattr(
+        "langchain_harness.agent_builder.create_deep_agent", fake_create_deep_agent
+    )
+    monkeypatch.setattr(
+        "langchain_harness.agent_builder.load_mcp_connections", lambda _path: {}
+    )
+
+    _write_agent_file(
+        tmp_path / ".claude" / "agents" / "discovered.md", "discovered", "body"
+    )
+    override = _write_agent_file(tmp_path / "override.md", "explicit", "body")
+
+    config = Config(provider="anthropic", model="claude-3")
+    await build_agent(
+        config,
+        tmp_path,
+        checkpointer=object(),
+        enable_shell=False,
+        skills_override=[],
+        memory_override=[],
+        agents_override=[override],
+    )
+
+    names = [spec["name"] for spec in captured["subagents"]]
+    assert names == ["explicit"]

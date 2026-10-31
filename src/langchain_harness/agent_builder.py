@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -124,6 +125,17 @@ def _load_subagents(
             )
             continue
 
+        # First definition wins: callers list global files before per-user
+        # published files, so a published agent cannot shadow a global one.
+        if str(name) in source_map:
+            logger.warning(
+                "Skipping agent %s: name %r already defined by %s",
+                path,
+                name,
+                source_map[str(name)],
+            )
+            continue
+
         subagent: SubAgent = {
             "name": str(name),
             "description": str(description),
@@ -206,6 +218,7 @@ async def build_agent(
     model: Any | None = None,
     tools_override: list[BaseTool] | None = None,
     backend: Any | None = None,
+    agents_override: list[Path] | None = None,
 ) -> Any:
     """Build a harness agent for *cwd*.
 
@@ -225,13 +238,21 @@ async def build_agent(
     skills_override:
         Explicit skills directory paths (skip discovery, use workspace copies).
     memory_override:
-        Explicit memory file paths (skip discovery, use workspace copies).
+        Explicit memory sources (skip discovery). Entries are used verbatim as
+        backend source paths, so they need not exist on the host: a virtual
+        path such as ``/CLAUDE.md`` is resolved by the backend. The caller is
+        responsible for passing only sources the backend can resolve; missing
+        sources are reported by the memory middleware, not dropped here.
     model:
         Pre-built model (skip model construction, used by server for shared model).
     tools_override:
         Pre-loaded MCP tools (skip MCP loading, used by server for shared tools).
     backend:
         Pre-built backend (skip backend construction).
+    agents_override:
+        Explicit agent definition file paths (skip agent discovery). The server
+        passes global files first, then the user's published files; ``_load_subagents``
+        keeps the first definition per name, so global agents win collisions.
     """
     if model is not None:
         _model = model
@@ -242,11 +263,17 @@ async def build_agent(
     # host cwd (subagents are parsed host-side, not from the workspace).
     # When no overrides are set, discover everything in a single pass.
     if skills_override is not None or memory_override is not None:
-        skills_dir, agent_paths, memory_paths_discovered = (
-            None, discover_agents(cwd), []
-        )
+        skills_dir, memory_paths_discovered = None, []
     else:
-        skills_dir, agent_paths, memory_paths_discovered = discover_all(cwd)
+        skills_dir, _, memory_paths_discovered = discover_all(cwd)
+
+    # Agent files: explicit override first, else discovery. Global files come
+    # before published user files in agents_override and _load_subagents keeps
+    # the FIRST definition per name, so global agents win collisions.
+    if agents_override is not None:
+        agent_paths = agents_override
+    else:
+        agent_paths = discover_agents(cwd)
 
     if skills_override is not None:
         skills = skills_override if skills_override else None
@@ -254,7 +281,9 @@ async def build_agent(
         skills = [str(skills_dir)] if skills_dir is not None else None
 
     if memory_override is not None:
-        memory_paths = [Path(p) for p in memory_override if Path(p).is_file()]
+        # Verbatim: entries are backend paths, not necessarily host paths, so
+        # filtering them with ``is_file()`` would drop every virtual source.
+        memory_paths: Sequence[str | Path] = memory_override
     else:
         memory_paths = memory_paths_discovered
 

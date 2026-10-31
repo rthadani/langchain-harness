@@ -15,7 +15,15 @@ import logging
 import shutil
 from pathlib import Path
 
+from langchain_harness.published import copy_into_workspace
+
 logger = logging.getLogger(__name__)
+
+# Backend (virtual) skill source paths. Order matters: the skills middleware
+# loads sources in order with later sources winning, so the user directory is
+# listed FIRST and the global directory LAST (global wins a name collision).
+GLOBAL_SKILLS_VPATH = "/.claude/skills"
+USER_SKILLS_VPATH = "/.claude/user-skills"
 
 
 def users_root(cwd: Path) -> Path:
@@ -50,6 +58,7 @@ def provision_user_workspace(cwd: Path, user_id: str) -> Path:
     # — no need to pre-create it.
 
     _sync_shared_config(cwd, workspace)
+    copy_into_workspace(cwd, user_id, workspace)
     return workspace
 
 
@@ -87,6 +96,36 @@ def _sync_shared_config(cwd: Path, workspace: Path) -> None:
         dst_notes.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src_notes, dst_notes)
         logger.info("Synced memory notes to %s", dst_notes)
+
+
+def workspace_skill_sources(workspace: Path) -> list[str]:
+    """Return backend (virtual) skill source paths for a provisioned workspace.
+
+    The user directory comes first and the global directory last because the
+    skills middleware lets later sources win, so a global skill shadows a
+    user-published skill with the same name.
+    """
+    sources: list[str] = []
+    if (workspace / ".claude" / "user-skills").is_dir():
+        sources.append(USER_SKILLS_VPATH)
+    if (workspace / ".claude" / "skills").is_dir():
+        sources.append(GLOBAL_SKILLS_VPATH)
+    return sources
+
+
+def workspace_memory_sources(workspace: Path) -> list[str]:
+    """Return backend (virtual) memory source paths for a provisioned workspace.
+
+    Sources are workspace-relative virtual paths because the server backend runs
+    in virtual mode, where it resolves them under the workspace root. Host
+    absolute paths would resolve under the root as well and never be found.
+    """
+    candidates = (
+        ("CLAUDE.md", "/CLAUDE.md"),
+        ("AGENTS.md", "/AGENTS.md"),
+        (".harness/memory/notes.md", "/.harness/memory/notes.md"),
+    )
+    return [vpath for rel, vpath in candidates if (workspace / rel).is_file()]
 
 
 def get_workspace_skills_dir(workspace: Path) -> Path | None:
