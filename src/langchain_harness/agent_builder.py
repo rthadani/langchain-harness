@@ -9,7 +9,7 @@ from typing import Any
 
 from deepagents.backends import FilesystemBackend, LocalShellBackend
 from deepagents.graph import create_deep_agent
-from deepagents.middleware.subagents import SubAgent
+from deepagents.middleware.subagents import GENERAL_PURPOSE_SUBAGENT, SubAgent
 from deepagents.middleware.summarization import (
     SummarizationMiddleware,
     SummarizationToolMiddleware,
@@ -21,6 +21,13 @@ from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_harness.config import CompactionConfig, Config
 from langchain_harness.discovery import discover_all, discover_agents, discover_mcp_config
 from langchain_harness.frontmatter import parse_file
+from langchain_harness.guardrails import (
+    GUARDRAILS_FILENAME,
+    GuardrailMiddleware,
+    discover_guardrails,
+    guardrail_permissions,
+    load_guardrails,
+)
 from langchain_harness.mcp_loader import load_mcp_connections
 
 logger = logging.getLogger(__name__)
@@ -89,12 +96,14 @@ def _resolve_subagent_model(value: str, provider: str, path: Path) -> str | None
 
 
 def _load_subagents(
-    agent_paths: list[Path], provider: str
+    agent_paths: list[Path], provider: str, *, guardrails_text: str | None = None
 ) -> tuple[list[SubAgent], dict[str, Path]]:
     """Parse agent markdown files into ``SubAgent`` definitions.
 
     Returns the subagents plus a mapping from subagent name to source file path
-    so that downstream failures can report the offending file.
+    so that downstream failures can report the offending file. When
+    *guardrails_text* is given, each spec gets its own ``GuardrailMiddleware``
+    so the guardrails reach subagent model calls too.
     """
     subagents: list[SubAgent] = []
     source_map: dict[str, Path] = {}
@@ -124,6 +133,8 @@ def _load_subagents(
             resolved = _resolve_subagent_model(str(metadata["model"]), provider, path)
             if resolved is not None:
                 subagent["model"] = resolved
+        if guardrails_text is not None:
+            subagent["middleware"] = [GuardrailMiddleware(guardrails_text)]
 
         subagents.append(subagent)
         source_map[str(name)] = path
@@ -247,7 +258,21 @@ async def build_agent(
     else:
         memory_paths = memory_paths_discovered
 
-    subagents, subagent_sources = _load_subagents(agent_paths, config.provider)
+    guardrails_text = load_guardrails(discover_guardrails(cwd))
+    subagents, subagent_sources = _load_subagents(
+        agent_paths, config.provider, guardrails_text=guardrails_text
+    )
+    if guardrails_text is not None and not any(
+        spec["name"] == GENERAL_PURPOSE_SUBAGENT["name"] for spec in subagents
+    ):
+        # graph.py fills model/tools for this spec; only guardrails are added.
+        subagents.insert(
+            0,
+            {
+                **GENERAL_PURPOSE_SUBAGENT,
+                "middleware": [GuardrailMiddleware(guardrails_text)],
+            },
+        )
 
     if tools_override is not None:
         mcp_tools = tools_override
@@ -281,9 +306,24 @@ async def build_agent(
     else:
         agent_backend = _build_backend(cwd, enable_shell=enable_shell, root_dir=root_dir)
 
-    middleware = _build_summarization_middleware(
-        _model, agent_backend, config.compaction, compact_nudge=config.prompts.compact_nudge
+    middleware = list(
+        _build_summarization_middleware(
+            _model,
+            agent_backend,
+            config.compaction,
+            compact_nudge=config.prompts.compact_nudge,
+        )
+        or []
     )
+    if guardrails_text is not None:
+        middleware.append(GuardrailMiddleware(guardrails_text))
+        if enable_shell:
+            logger.warning(
+                "Guardrails are advisory only under shell: filesystem permissions "
+                "are not enforced on execution backends and the agent can edit "
+                "%s",
+                GUARDRAILS_FILENAME,
+            )
 
     agent_kwargs: dict[str, Any] = {
         "model": _model,
@@ -295,8 +335,12 @@ async def build_agent(
         "backend": agent_backend,
         "checkpointer": checkpointer,
     }
-    if middleware is not None:
+    if middleware:
         agent_kwargs["middleware"] = middleware
+
+    permissions = guardrail_permissions(enable_shell)
+    if permissions:
+        agent_kwargs["permissions"] = permissions
 
     try:
         return create_deep_agent(**agent_kwargs)

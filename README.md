@@ -83,6 +83,7 @@ All discovery is relative to the **current working directory**. When `--workspac
 - **Subagents:** `.claude/agents/*.md` → parsed as `SubAgent` definitions. Frontmatter must contain `name` and `description`; `model` is optional. The `model` value can be a provider-prefixed ID (`provider:model`), one of the aliases `sonnet`, `opus`, or `haiku`, or `inherit` to use the parent agent's model. Any `tools:` frontmatter list is ignored in this version.
   - **Subagent model resolution is independent:** a subagent `model:` value is passed straight to deepagents and resolved by the `langchain` provider it names. It does **not** inherit the harness's `base_url` or `api_key`; it hits that provider's default endpoint using its own env-var keys (e.g. `OPENAI_API_KEY` for an `openai:` model).
 - **Memory:** `CLAUDE.md`, `AGENTS.md`, and `.harness/memory/notes.md` (approved session notes) → passed as `memory=[...]` paths to `create_deep_agent`.
+- **Guardrails:** `GUARDRAILS.md` in the working directory is read host-side at build time and appended to the system prompt on every model call, including subagent calls. It is never read through the agent backend, never copied into user workspaces, and is protected by a deny-write filesystem permission in server mode. It is not a memory source.
 - **MCP:** `mcp.json` in Claude Code format. Example:
 
 ```json
@@ -208,7 +209,7 @@ Skills (`.claude/skills`) and memory files (`CLAUDE.md`, `AGENTS.md`) are read t
 - `CLAUDE.md` / `AGENTS.md` → `<user-workspace>/`
 - `.harness/memory/notes.md` → `<user-workspace>/.harness/memory/notes.md` (approved notes only; the inbox is never copied)
 
-Agent definition files (`.claude/agents/*.md`) and `mcp.json` are parsed host-side, so they stay shared without copying.
+Agent definition files (`.claude/agents/*.md`) and `mcp.json` are parsed host-side, so they stay shared without copying. `GUARDRAILS.md` is deliberately excluded from the copy: it is loaded host-side so sessions cannot edit or replace it.
 
 ### Server configuration
 
@@ -300,6 +301,7 @@ filesystem. Reference manifests are in `deploy/README.md`.
 - **Session memory grows unboundedly:** `.harness/memory/notes.md` accumulates one section per approved note. Trim it manually when it gets long.
 - **Conversation offloads:** deepagents may write large conversation summaries to `<cwd>/conversation_history/<session>.md` and `<cwd>/large_tool_results/`. These directories appear in the current working directory, or in the workspace folder when `--workspace` is set.
 - **Server-mode MCP is shared:** MCP servers configured in `mcp.json` are loaded once and shared across all users. They are outside the per-user privacy boundary.
+- **Prose guardrails are not a security boundary:** `GUARDRAILS.md` reinforces behaviour but cannot guarantee it. With `enable_shell = true` the immutable-guardrail claim does not hold: filesystem permissions are not enforced on execution backends and the agent can edit the file. Rules that must hold absolutely belong in permissions or the tool allowlist.
 
 ## Development
 

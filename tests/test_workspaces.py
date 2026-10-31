@@ -142,3 +142,12 @@ def test_provision_does_not_copy_memory_inbox(tmp_path: Path) -> None:
 
     assert (workspace / ".harness" / "memory" / "notes.md").is_file()
     assert not (workspace / ".harness" / "memory" / "inbox").exists()
+
+
+def test_provision_does_not_copy_guardrails(tmp_path: Path) -> None:
+    # Guardrails are host-side only; a workspace copy would be stale or tampered.
+    (tmp_path / "GUARDRAILS.md").write_text("# Host rules", encoding="utf-8")
+
+    workspace = provision_user_workspace(tmp_path, "u123")
+
+    assert not (workspace / "GUARDRAILS.md").exists()
