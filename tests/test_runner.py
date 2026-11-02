@@ -60,7 +60,7 @@ async def test_stream_turn_passes_messages_dict_directly(monkeypatch) -> None:
     assert len(agent.inputs) == 1
     input_data, config, version = agent.inputs[0]
     assert version == "v2"
-    assert config == {"configurable": {"thread_id": "thread-1"}}
+    assert config["configurable"] == {"thread_id": "thread-1"}
     assert isinstance(input_data, dict)
     assert "messages" in input_data
     assert len(input_data["messages"]) == 1

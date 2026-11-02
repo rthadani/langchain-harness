@@ -12,11 +12,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 from typing import Any
 
 import httpx
 import pytest
 
+from langchain_harness.api import sse as sse_module
 from langchain_harness.api.app import create_app
 from langchain_harness.api.sse import stream_sse_response
 from langchain_harness.config import Config
@@ -146,3 +148,36 @@ async def test_streaming_completes_normally(tmp_path, monkeypatch) -> None:
             body = resp.text
             assert "event: token" in body
             assert "event: done" in body
+
+
+@pytest.mark.asyncio
+async def test_stream_sse_response_forwards_user_id_and_run_id(monkeypatch) -> None:
+    """SSE must forward user_id and surface run_id on the done frame."""
+
+    captured: dict[str, Any] = {}
+
+    async def _fake_stream_turn_events(*args: Any, **kwargs: Any):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        yield {"type": "token", "text": "hi"}
+        yield {"type": "done", "run_id": "run-abc-123"}
+
+    monkeypatch.setattr(
+        sse_module, "stream_turn_events", _fake_stream_turn_events
+    )
+
+    frames: list[str] = []
+    agent = object()
+    async for frame in stream_sse_response(
+        agent, "hello", "thread-1", _FakeRequest(), user_id="alice"
+    ):
+        frames.append(frame)
+
+    assert captured["args"] == (agent, "hello", "thread-1")
+    assert captured["kwargs"]["user_id"] == "alice"
+    assert captured["kwargs"]["cancel_outcome"] == "client_disconnect"
+
+    done_frames = [f for f in frames if f.startswith("event: done")]
+    assert len(done_frames) == 1
+    payload = json.loads(done_frames[0].split("data: ", 1)[1])
+    assert payload == {"run_id": "run-abc-123"}

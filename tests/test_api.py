@@ -376,6 +376,7 @@ async def test_sse_streaming_shows_tokens_and_done(test_env) -> None:
     assert "Hello " in body
     assert "world!" in body
     assert "event: done" in body
+    assert '"run_id"' in body
 
 
 @pytest.mark.asyncio

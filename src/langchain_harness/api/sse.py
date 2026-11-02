@@ -21,17 +21,25 @@ async def stream_sse_response(
     prompt: str,
     thread_id: str,
     request: Request,
+    *,
+    user_id: str | None = None,
 ) -> AsyncIterator[str]:
     """Stream agent events as SSE, cancelling on client disconnect.
 
     Yields SSE-formatted strings. If the client disconnects, the underlying
-    streaming task is cancelled.
+    streaming task is cancelled and the turn is recorded as ``client_disconnect``.
     """
     queue: asyncio.Queue[str | None] = asyncio.Queue()
 
     async def _produce() -> None:
         try:
-            async for event in stream_turn_events(agent, prompt, thread_id):
+            async for event in stream_turn_events(
+                agent,
+                prompt,
+                thread_id,
+                user_id=user_id,
+                cancel_outcome="client_disconnect",
+            ):
                 etype = event["type"]
                 if etype == "token":
                     await queue.put(_sse_event("token", {"text": event["text"]}))
@@ -46,7 +54,7 @@ async def stream_sse_response(
                         "output": event.get("output"),
                     }))
                 elif etype == "done":
-                    await queue.put(_sse_event("done", {}))
+                    await queue.put(_sse_event("done", {"run_id": event.get("run_id")}))
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001

@@ -127,7 +127,9 @@ async def send_message(
 
     async def _stream():
         try:
-            async for chunk in stream_sse_response(agent, body.content, thread_id, request):
+            async for chunk in stream_sse_response(
+                agent, body.content, thread_id, request, user_id=user_id
+            ):
                 yield chunk
         finally:
             try:
@@ -164,7 +166,9 @@ async def compact_session(
 
     async def _stream():
         try:
-            async for chunk in stream_sse_response(agent, compact_prompt, thread_id, request):
+            async for chunk in stream_sse_response(
+                agent, compact_prompt, thread_id, request, user_id=user_id
+            ):
                 yield chunk
         finally:
             try:

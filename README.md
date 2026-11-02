@@ -154,6 +154,20 @@ Approved notes in `.harness/memory/notes.md` are added to the agent's `memory` o
 
 In server mode the inbox lives host-side at `<server-cwd>/.harness/memory/inbox/` — outside every user's workspace. Approved notes are copied into each user's workspace on their next agent build (copy-on-build, like `CLAUDE.md`/`AGENTS.md`); only `notes.md` is synced, never the inbox. Notes approved after a user's agent is already built won't reach that user until the server restarts or the agent is rebuilt.
 
+## Turn metrics
+
+Every turn — REPL, one-shot, `POST /messages`, `/compact` — logs exactly one JSON line on the `langchain_harness.metrics` logger, so turns can be costed and compared without a database:
+
+```json
+{"run_id":"5f1c...","thread_id":"a3b9...","user_id":"alice","model_calls":3,"input_tokens":812,"output_tokens":145,"overhead_calls":0,"overhead_tokens":0,"model_ms":4210.7,"ttft_ms":640.2,"total_ms":5310.4,"tools":[{"name":"search","ms":120.5,"error":null}],"outcome":"ok","error":null,"tool_calls":1,"tool_errors":0}
+```
+
+`ttft_ms` is time to first token, `overhead_*` counts compaction-middleware model calls separately from the answer's, and `tools` carries per-call latency plus any error. `outcome` is one of `ok`, `error`, `cancelled` (turn interrupted), or `client_disconnect` (SSE consumer went away).
+
+The `done` event (and its SSE frame) now carries `run_id` — the root trace id for the turn — so user feedback or a judge score can be joined back to the metrics line later. See [`tracing-plan.md`](tracing-plan.md) for the wider design (trace backends, feedback, regression sets).
+
+Each line carries `user_id`; hash or drop it before shipping metrics to a shared store. Token counts read 0 when an OpenAI-compatible endpoint omits usage while streaming.
+
 ## Server mode (multi-user web API)
 
 The harness can run as a multi-user web API server with per-user workspace isolation and pluggable auth.
