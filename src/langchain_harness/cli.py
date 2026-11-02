@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import sys
 from pathlib import Path
 from uuid import uuid4
@@ -313,10 +314,15 @@ def serve(
     model: str | None = typer.Option(None, "--model", help="Model name."),
     base_url: str | None = typer.Option(None, "--base-url", help="Custom base URL."),
     api_key: str | None = typer.Option(None, "--api-key", help="API key for the provider."),
+    workspace: str | None = typer.Option(
+        None,
+        "--workspace",
+        help="Working folder for discovery and state. A relative path resolves against the current directory; ~ expands.",
+    ),
 ) -> None:
     """Start the multi-user web API server."""
     _setup_logging()
-    cwd = Path.cwd()
+    cwd = _resolve_root(workspace or os.environ.get("HARNESS_SERVER_WORKSPACE"))
     config = resolve_config(
         cwd,
         provider=provider,
@@ -345,17 +351,25 @@ def serve(
 
 
 @db_app.command("init")
-def db_init() -> None:
+def db_init(
+    workspace: str | None = typer.Option(
+        None,
+        "--workspace",
+        help="Working folder holding the state. A relative path resolves against the current directory; ~ expands.",
+    ),
+) -> None:
     """Create the sessions and checkpoint schema (idempotent).
 
     Uses Postgres when HARNESS_DATABASE_URL is set, otherwise SQLite under
-    <cwd>/.harness.
+    <workspace>/.harness.
     """
     _setup_logging()
     from langchain_harness.store import open_store
 
+    root = _resolve_root(workspace)
+
     async def _init() -> None:
-        async with open_store(Path.cwd()) as store:
+        async with open_store(root) as store:
             Console().print(
                 f"Initialized {store.backend} store at {store.describe()}."
             )

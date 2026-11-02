@@ -42,11 +42,12 @@ Resolution order: **environment variables > CLI flags > `harness.toml`**.
   unset the server uses SQLite under `<cwd>/.harness`. Applies to `serve` and
   `db init`; local `run`/`sessions`/`memory` still use SQLite.
 - `HARNESS_DATABASE_POOL_SIZE` — Postgres connection pool size (default 10).
+- `HARNESS_SERVER_WORKSPACE` — default `--workspace` for `serve`; the CLI flag wins.
 
 ### CLI flags
 
 - `--provider`, `--model`, `--base-url`, `--api-key`
-- `--workspace <path>` — working folder to run in (equivalent to `cd <path> && harness`). Discovery, `harness.toml`, `sessions.db`, and the agent backend all follow it. A relative path resolves against the current directory, and `~` expands. Applies to `run`, `sessions`, and `memory` only (not `serve`).
+- `--workspace <path>` — working folder to run in (equivalent to `cd <path> && harness`). Discovery, `harness.toml`, `sessions.db`, and the agent backend all follow it. A relative path resolves against the current directory, and `~` expands. Applies to `run`, `sessions`, `memory`, `eval`, `db init`, and `serve`.
 
 ### `harness.toml`
 
@@ -210,6 +211,8 @@ uv run harness db init
 # start the server
 HARNESS_PROVIDER=anthropic HARNESS_MODEL=claude-3-5-sonnet-latest HARNESS_API_KEY=... uv run harness serve
 ```
+
+The server's working directory — `serve --workspace <path>` or `HARNESS_SERVER_WORKSPACE` — decides where `GUARDRAILS.md`, `.claude/skills`, `.claude/agents`, memory, `mcp.json`, and `harness.toml` are read from, and `.harness/` under it must be writable. Without either, it uses the process working directory.
 
 ### API surface
 

@@ -1,5 +1,6 @@
 import asyncio
 import sys
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
@@ -445,6 +446,124 @@ def test_run_workspace_self_contained_form(isolate_cwd, monkeypatch) -> None:
 def test_first_positional_index_skips_host_and_port() -> None:
     assert cli._first_positional_index(["harness", "--host", "127.0.0.1", "serve"]) == 3
     assert cli._first_positional_index(["harness", "--port", "8000", "serve"]) == 3
+
+
+# ---------------------------------------------------------------------------
+# serve and db init working directory
+# ---------------------------------------------------------------------------
+
+_SENTINEL_APP = object()
+
+
+def _patch_serve(monkeypatch) -> dict[str, Any]:
+    """Replace serve's collaborators with spies that record their arguments."""
+    captured: dict[str, Any] = {}
+
+    def fake_resolve_config(root: Path, **kwargs: Any) -> Config:
+        captured["config_root"] = root
+        return Config(provider="openai", model="gpt-4o")
+
+    def fake_create_app(root: Path, config: Config) -> Any:
+        captured["app_root"] = root
+        return _SENTINEL_APP
+
+    def fake_uvicorn_run(fastapi_app: Any, **kwargs: Any) -> None:
+        captured["uvicorn_app"] = fastapi_app
+
+    monkeypatch.setattr("langchain_harness.cli.resolve_config", fake_resolve_config)
+    monkeypatch.setattr("langchain_harness.api.app.create_app", fake_create_app)
+    monkeypatch.setattr("uvicorn.run", fake_uvicorn_run)
+    return captured
+
+
+def test_serve_workspace_flag_sets_root(isolate_cwd, monkeypatch) -> None:
+    ws = isolate_cwd / "config"
+    ws.mkdir()
+    captured = _patch_serve(monkeypatch)
+    monkeypatch.delenv("HARNESS_SERVER_WORKSPACE", raising=False)
+    monkeypatch.setattr("sys.argv", ["harness", "serve", "--workspace", str(ws)])
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main()
+
+    assert exc_info.value.code == 0
+    assert captured["config_root"] == ws.resolve()
+    assert captured["app_root"] == ws.resolve()
+    assert captured["uvicorn_app"] is _SENTINEL_APP
+
+
+def test_serve_workspace_env_fallback(isolate_cwd, monkeypatch) -> None:
+    ws = isolate_cwd / "config"
+    ws.mkdir()
+    captured = _patch_serve(monkeypatch)
+    monkeypatch.setenv("HARNESS_SERVER_WORKSPACE", str(ws))
+    monkeypatch.setattr("sys.argv", ["harness", "serve"])
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main()
+
+    assert exc_info.value.code == 0
+    assert captured["config_root"] == ws.resolve()
+    assert captured["app_root"] == ws.resolve()
+
+
+def test_serve_workspace_flag_beats_env(isolate_cwd, monkeypatch) -> None:
+    flag_dir = isolate_cwd / "from-flag"
+    flag_dir.mkdir()
+    env_dir = isolate_cwd / "from-env"
+    env_dir.mkdir()
+    captured = _patch_serve(monkeypatch)
+    monkeypatch.setenv("HARNESS_SERVER_WORKSPACE", str(env_dir))
+    monkeypatch.setattr("sys.argv", ["harness", "serve", "--workspace", str(flag_dir)])
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main()
+
+    assert exc_info.value.code == 0
+    assert captured["config_root"] == flag_dir.resolve()
+    assert captured["app_root"] == flag_dir.resolve()
+
+
+def test_serve_without_workspace_uses_cwd(isolate_cwd, monkeypatch) -> None:
+    captured = _patch_serve(monkeypatch)
+    monkeypatch.delenv("HARNESS_SERVER_WORKSPACE", raising=False)
+    monkeypatch.setattr("sys.argv", ["harness", "serve"])
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main()
+
+    assert exc_info.value.code == 0
+    assert captured["config_root"] == Path.cwd() == isolate_cwd.resolve()
+    assert captured["app_root"] == isolate_cwd.resolve()
+
+
+def test_db_init_workspace_sets_root(isolate_cwd, monkeypatch, capsys) -> None:
+    ws = isolate_cwd / "config"
+    ws.mkdir()
+    captured: dict[str, Any] = {}
+
+    class _FakeStore:
+        backend = "sqlite"
+
+        def describe(self) -> str:
+            return str(ws / ".harness" / "sessions.db")
+
+    @asynccontextmanager
+    async def fake_open_store(root: Path):
+        captured["root"] = root
+        yield _FakeStore()
+
+    monkeypatch.setattr("langchain_harness.store.open_store", fake_open_store)
+    monkeypatch.setattr(
+        "sys.argv", ["harness", "db", "init", "--workspace", str(ws)]
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main()
+
+    assert exc_info.value.code == 0
+    assert captured["root"] == ws.resolve()
+    assert "Initialized sqlite store" in capsys.readouterr().out
 
 
 # ---------------------------------------------------------------------------

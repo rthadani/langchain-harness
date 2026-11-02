@@ -55,6 +55,30 @@ curl -sN -X POST http://localhost:8000/v1/sessions \
   -d '{"title":"first chat"}'
 ```
 
+## Mount the config instead of baking it
+
+The image ships with `deploy/agent/` at `/app`, but you can keep the config
+outside the image and mount it at runtime:
+
+```bash
+podman run --rm -p 8000:8000 \
+  -v "$PWD/bot-config:/config:ro" \
+  -v harness-state:/config/.harness \
+  -e HARNESS_PROVIDER=openai -e HARNESS_MODEL=gpt-4o -e HARNESS_API_KEY="$OPENAI_API_KEY" \
+  langchain-harness:0.1.0 serve --workspace /config
+```
+
+`--workspace /config` (or `HARNESS_SERVER_WORKSPACE=/config`) makes all discovery
+read from the mount: `GUARDRAILS.md`, `CLAUDE.md`, `AGENTS.md`, `.claude/skills`,
+`.claude/agents`, `mcp.json`, and `harness.toml`. Per-user state lives under
+`<workspace>/.harness/`, so that path must be writable — the nested
+`-v harness-state:/config/.harness` volume keeps the config mount read-only while
+state persists, and mounting the config directory read-write works too. Nothing
+needs to be rebuilt or baked in to change guardrails: edit the mounted file and
+restart (or wait for the user's next agent build, since agents are cached per
+user). Without `--workspace`, behavior is unchanged and the image's `/app`
+profile is used.
+
 ## 4. Kubernetes
 
 ```bash
@@ -214,6 +238,6 @@ Set through the Secret as env vars:
   command uses the system interpreter, not the venv.
 - `harness.toml` and the prompt files are baked into the image. Changing them
   requires a rebuild; mount a ConfigMap over `/app` only if you accept that it
-  hides the baked profile.
+  hides the baked profile (or mount a config dir and use `serve --workspace`).
 - The container runs as UID/GID 1000. Match `runAsUser`/`fsGroup` or the volume
   will be unwritable.
