@@ -208,7 +208,7 @@ The server supports two auth modes, set in `HARNESS_SERVER_AUTH_MODES` or in
   The user id comes from `[server.jwt] user_claim` (default `sub`). Requires
   both `issuer` and `audience`.
 
-See the main README for full JWT configuration.
+See [Server mode → Auth](../docs/server.md#auth) for full JWT configuration.
 
 ## Configuration reference
 
