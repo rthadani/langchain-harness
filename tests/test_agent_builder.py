@@ -9,9 +9,10 @@ from langchain_harness.agent_builder import (
     _load_subagents,
     _resolve_subagent_model,
     build_agent,
+    build_eval_model,
     build_model,
 )
-from langchain_harness.config import CompactionConfig, Config
+from langchain_harness.config import CompactionConfig, Config, EvalConfig
 
 
 def test_load_subagents_skips_missing_name_or_description(tmp_path: Path, caplog) -> None:
@@ -132,6 +133,79 @@ def test_build_model_kwargs_matrix(monkeypatch) -> None:
         "gpt-4",
         {"model_provider": "openai", "base_url": "http://x", "api_key": "k"},
     )
+
+
+def _capture_init_chat_model(monkeypatch) -> list[tuple[str, dict[str, Any]]]:
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    def fake_init(model: str, **kwargs: Any) -> object:
+        calls.append((model, kwargs))
+        return object()
+
+    monkeypatch.setattr("langchain_harness.agent_builder.init_chat_model", fake_init)
+    return calls
+
+
+def test_build_eval_model_returns_none_when_unset(monkeypatch) -> None:
+    calls = _capture_init_chat_model(monkeypatch)
+
+    assert build_eval_model(Config(provider="anthropic", model="claude-3")) is None
+    assert build_eval_model(
+        Config(provider="anthropic", model="claude-3", eval=EvalConfig(model="  "))
+    ) is None
+    assert calls == []
+
+
+def test_build_eval_model_bare_id_uses_config_provider(monkeypatch) -> None:
+    calls = _capture_init_chat_model(monkeypatch)
+    config = Config(
+        provider="openai",
+        model="gpt-4",
+        base_url="http://x",
+        api_key="k",
+        eval=EvalConfig(model="gpt-4o-mini"),
+    )
+
+    build_eval_model(config)
+
+    assert calls == [
+        ("gpt-4o-mini", {"model_provider": "openai", "base_url": "http://x", "api_key": "k"})
+    ]
+
+
+def test_build_eval_model_foreign_provider_omits_harness_credentials(monkeypatch) -> None:
+    calls = _capture_init_chat_model(monkeypatch)
+    config = Config(
+        provider="openai",
+        model="gpt-4",
+        base_url="http://localhost:11434/v1",
+        api_key="harness-secret",
+        eval=EvalConfig(model="anthropic:claude-3-5-sonnet-latest"),
+    )
+
+    build_eval_model(config)
+
+    assert calls == [("claude-3-5-sonnet-latest", {"model_provider": "anthropic"})]
+
+
+def test_build_eval_model_trims_spec(monkeypatch) -> None:
+    calls = _capture_init_chat_model(monkeypatch)
+
+    build_eval_model(
+        Config(provider="openai", model="gpt-4", eval=EvalConfig(model="  gpt-4o "))
+    )
+    build_eval_model(
+        Config(
+            provider="openai",
+            model="gpt-4",
+            eval=EvalConfig(model="  anthropic:  claude-3-5  "),
+        )
+    )
+
+    assert calls == [
+        ("gpt-4o", {"model_provider": "openai"}),
+        ("claude-3-5", {"model_provider": "anthropic"}),
+    ]
 
 
 @pytest.mark.asyncio

@@ -2,11 +2,19 @@ from pathlib import Path
 
 import pytest
 
-from langchain_harness.config import CompactionConfig, Config, resolve_config
+from langchain_harness.config import CompactionConfig, Config, EvalConfig, resolve_config
 
 
 def _clear_keys(monkeypatch) -> None:
-    for key in ("HARNESS_MODEL", "HARNESS_PROVIDER", "HARNESS_BASE_URL", "HARNESS_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"):
+    for key in (
+        "HARNESS_MODEL",
+        "HARNESS_PROVIDER",
+        "HARNESS_BASE_URL",
+        "HARNESS_API_KEY",
+        "HARNESS_EVAL_MODEL",
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+    ):
         monkeypatch.delenv(key, raising=False)
 
 
@@ -145,3 +153,54 @@ def test_compaction_invalid_values_ignored(tmp_path: Path, monkeypatch) -> None:
     config = resolve_config(tmp_path)
     assert config.compaction.trigger_tokens is None
     assert config.compaction.keep_messages == 20
+
+
+def test_eval_model_defaults_to_none(tmp_path: Path, monkeypatch) -> None:
+    _clear_keys(monkeypatch)
+    monkeypatch.setenv("HARNESS_MODEL", "gpt-4")
+
+    config = resolve_config(tmp_path)
+
+    assert config.eval == EvalConfig()
+    assert config.eval.model is None
+
+
+def test_eval_model_from_toml(tmp_path: Path, monkeypatch) -> None:
+    _clear_keys(monkeypatch)
+    monkeypatch.setenv("HARNESS_MODEL", "gpt-4")
+    (tmp_path / "harness.toml").write_text(
+        "[eval]\nmodel = 'anthropic:claude-3-5-sonnet-latest'\n", encoding="utf-8"
+    )
+
+    config = resolve_config(tmp_path)
+
+    assert config.eval.model == "anthropic:claude-3-5-sonnet-latest"
+
+
+def test_eval_model_env_overrides_toml(tmp_path: Path, monkeypatch) -> None:
+    _clear_keys(monkeypatch)
+    monkeypatch.setenv("HARNESS_MODEL", "gpt-4")
+    monkeypatch.setenv("HARNESS_EVAL_MODEL", "openai:gpt-4o-mini")
+    (tmp_path / "harness.toml").write_text(
+        "[eval]\nmodel = 'anthropic:claude-3-5-sonnet-latest'\n", encoding="utf-8"
+    )
+
+    config = resolve_config(tmp_path)
+
+    assert config.eval.model == "openai:gpt-4o-mini"
+
+
+@pytest.mark.parametrize("spec", ["openai:", ":gpt-4o", " : ", "openai:   "])
+def test_eval_model_rejects_malformed_spec(
+    tmp_path: Path, monkeypatch, capsys, spec: str
+) -> None:
+    _clear_keys(monkeypatch)
+    monkeypatch.setenv("HARNESS_MODEL", "gpt-4")
+    (tmp_path / "harness.toml").write_text(
+        f"[eval]\nmodel = '{spec}'\n", encoding="utf-8"
+    )
+
+    with pytest.raises(SystemExit):
+        resolve_config(tmp_path)
+
+    assert "model must be 'model' or 'provider:model'" in capsys.readouterr().err

@@ -14,11 +14,12 @@ from rich.console import Console
 from rich.markup import escape
 
 from langchain_harness import memory
-from langchain_harness.agent_builder import build_agent, build_model
+from langchain_harness.agent_builder import build_agent, build_eval_model, build_model
 from langchain_harness.config import resolve_config
 from langchain_harness.discovery import discover_memory
 from langchain_harness.memory import eval_session
 from langchain_harness.runner import _print_eval_result, repl, run_once
+from langchain_harness.tracing import default_metrics_path
 from langchain_harness import sessions
 from langchain_harness.sessions import connect, get_latest, resolve_prefix
 
@@ -116,6 +117,8 @@ def run(
             async with AsyncSqliteSaver.from_conn_string(str(db)) as checkpointer:
                 await checkpointer.setup()
                 model = build_model(config)
+                judge_model = build_eval_model(config)
+                metrics_path = default_metrics_path(root)
                 agent = await build_agent(
                     config, root, checkpointer=checkpointer, model=model
                 )
@@ -129,6 +132,7 @@ def run(
                         model=model,
                         memory_root=root,
                         prompts=config.prompts,
+                        metrics_path=metrics_path,
                     )
                 else:
                     await repl(
@@ -138,6 +142,8 @@ def run(
                         model=model,
                         memory_root=root,
                         prompts=config.prompts,
+                        judge_model=judge_model,
+                        metrics_path=metrics_path,
                     )
 
     asyncio.run(_run())
@@ -270,6 +276,7 @@ def eval_command(
         async with AsyncSqliteSaver.from_conn_string(str(db)) as checkpointer:
             await checkpointer.setup()
             model_obj = build_model(config)
+            judge = build_eval_model(config) or model_obj
             agent = await build_agent(config, root, checkpointer=checkpointer, model=model_obj)
 
             memory_texts: list[str] = []
@@ -280,9 +287,10 @@ def eval_command(
                     pass
 
             result = await eval_session(
-                model_obj, agent, thread_id,
+                judge, agent, thread_id,
                 memory_texts=memory_texts,
                 system_prompt=config.prompts.eval,
+                metrics_path=default_metrics_path(root),
             )
             if result is None:
                 console.print("Nothing to evaluate.")

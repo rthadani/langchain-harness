@@ -4,3 +4,5 @@ Scoring guide:
 scope_adherence — did the agent stay within the intent of any project instructions provided? Penalise tangents, over-reach, or refusals that were clearly in scope.
 task_completion — did the agent fully accomplish what the user asked? 0 = no attempt, 10 = fully done with no loose ends.
 tool_use_quality — were tool calls appropriate and non-redundant? Penalise repeated reads of the same file, wrong tool choice, or missing tool calls where one was needed.
+
+When turn metrics are provided, treat them as the primary evidence for tool_use_quality. Repeated calls to the same tool, any tool_errors, and a high model_calls count with few or no tool calls all indicate weaker tool use. Do not infer tool calls that neither the metrics nor the transcript show.

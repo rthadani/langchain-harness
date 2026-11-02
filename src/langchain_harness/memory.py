@@ -20,8 +20,15 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from langchain_harness import prompts as _prompts
 from langchain_harness.frontmatter import parse_frontmatter
+from langchain_harness.tracing import (
+    ToolStat,
+    TurnMetrics,
+    app_version,
+    recent_turn_metrics,
+)
 
 logger = logging.getLogger(__name__)
+eval_logger = logging.getLogger("langchain_harness.eval")
 
 _SUMMARIZE_SYSTEM_PROMPT = _prompts.load("summarize")
 
@@ -36,6 +43,11 @@ _TRUNCATION_MARKER = "\n...[truncated]"
 
 _DEFAULT_TITLE = "Untitled session"
 
+# The judge only needs enough recent turns to judge tool use; more than this
+# competes with the conversation for the model's attention.
+_METRICS_TURN_LIMIT = 10
+_METRICS_BLOCK_CHAR_LIMIT = 1500
+
 _EVAL_SYSTEM_PROMPT = _prompts.load("eval")
 
 
@@ -48,6 +60,7 @@ class EvalResult:
     tool_use_quality: int
     tool_use_reason: str
     verdict: str
+    run_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -233,6 +246,94 @@ def _render_conversation(messages: list[Any]) -> str:
     return rendered
 
 
+def _completed_turns(turns: list[TurnMetrics]) -> list[TurnMetrics]:
+    """Keep only finished turns; an unfinished turn has no ``total_ms``."""
+    return [turn for turn in turns if turn.total_ms is not None]
+
+
+def _tool_counts(tools: list[ToolStat]) -> dict[str, int]:
+    """Count calls per tool name, preserving first-seen order."""
+    counts: dict[str, int] = {}
+    for tool in tools:
+        counts[tool.name] = counts.get(tool.name, 0) + 1
+    return counts
+
+
+def _tool_error_counts(tools: list[ToolStat]) -> dict[str, int]:
+    """Count failed calls per tool name, preserving first-seen order."""
+    counts: dict[str, int] = {}
+    for tool in tools:
+        if tool.error:
+            counts[tool.name] = counts.get(tool.name, 0) + 1
+    return counts
+
+
+def _render_tool_summary(tools: list[ToolStat]) -> str:
+    """Render ``read_file x3, grep x1 (1 err)`` for a turn's tool calls."""
+    errors = _tool_error_counts(tools)
+    parts: list[str] = []
+    for name, count in _tool_counts(tools).items():
+        part = f"{name} x{count}"
+        if errors.get(name):
+            part += f" ({errors[name]} err)"
+        parts.append(part)
+    return ", ".join(parts)
+
+
+def _format_ms(value: float | None) -> str:
+    return "n/a" if value is None else str(int(round(value)))
+
+
+def _render_metrics(turns: list[TurnMetrics]) -> str:
+    """Render the turn-metrics block for the eval prompt; ``""`` when empty."""
+    finished = _completed_turns(turns)
+    if not finished:
+        return ""
+    shown = finished[-_METRICS_TURN_LIMIT:]
+    lines = [
+        f"Turn metrics (most recent last; showing last {len(shown)} of "
+        f"{len(finished)} recorded turns):"
+    ]
+    for turn in shown:
+        tool_errors = sum(1 for tool in turn.tools if tool.error)
+        lines.append(
+            f"- run={turn.run_id[:8]} outcome={turn.outcome} model_calls={turn.model_calls} "
+            f"tools=[{_render_tool_summary(turn.tools)}] tool_errors={tool_errors} "
+            f"ttft_ms={_format_ms(turn.ttft_ms)} total_ms={_format_ms(turn.total_ms)} "
+            f"overhead_tokens={turn.overhead_tokens}"
+        )
+    rendered = "\n".join(lines)
+    if len(rendered) > _METRICS_BLOCK_CHAR_LIMIT:
+        return rendered[:_METRICS_BLOCK_CHAR_LIMIT] + _TRUNCATION_MARKER
+    return rendered
+
+
+def _metrics_summary(turns: list[TurnMetrics]) -> dict[str, Any]:
+    """Summarize the turns an eval was judged against, for the joined record."""
+    return {
+        "turn_count": len(turns),
+        "totals": {
+            "model_calls": sum(turn.model_calls for turn in turns),
+            "tool_calls": sum(len(turn.tools) for turn in turns),
+            "tool_errors": sum(1 for turn in turns for tool in turn.tools if tool.error),
+            "overhead_tokens": sum(turn.overhead_tokens for turn in turns),
+        },
+        "turns": [
+            {
+                "run_id": turn.run_id,
+                "outcome": turn.outcome,
+                "model_calls": turn.model_calls,
+                "tools": _tool_counts(turn.tools),
+                "tool_errors": sum(1 for tool in turn.tools if tool.error),
+                "ttft_ms": turn.ttft_ms,
+                "total_ms": turn.total_ms,
+                "overhead_tokens": turn.overhead_tokens,
+            }
+            for turn in turns
+        ],
+    }
+
+
 async def summarize_session(
     model: Any,
     agent: Any,
@@ -280,8 +381,15 @@ async def eval_session(
     *,
     memory_texts: list[str] | None = None,
     system_prompt: str | None = None,
+    metrics: list[TurnMetrics] | None = None,
+    metrics_path: Path | None = None,
+    run_id: str | None = None,
 ) -> EvalResult | None:
     """Evaluate a session on scope adherence, task completion, and tool use quality.
+
+    The last few turn metrics of *thread_id* are added to the prompt as objective
+    evidence for tool use: read from *metrics* when given, otherwise from the
+    durable sink at *metrics_path*, otherwise from the in-memory registry.
 
     Returns None when the session has no substantive content or when the model
     call fails for any reason. Never raises.
@@ -295,11 +403,24 @@ async def eval_session(
         if not _has_substantive_content(messages):
             return None
 
+        turns = (
+            metrics
+            if metrics is not None
+            else recent_turn_metrics(
+                thread_id, limit=_METRICS_TURN_LIMIT, path=metrics_path
+            )
+        )
+        turns = _completed_turns(turns)
+        resolved_run_id = run_id or (turns[-1].run_id if turns else None)
+
         parts: list[str] = []
         if memory_texts:
             for text in memory_texts:
                 if text.strip():
                     parts.append(f"Project instructions:\n{text.strip()}")
+        metrics_block = _render_metrics(turns)
+        if metrics_block:
+            parts.append(metrics_block)
         parts.append(f"Conversation:\n{_render_conversation(messages)}")
 
         result = await model.ainvoke(
@@ -318,7 +439,7 @@ async def eval_session(
         raw = "\n".join(lines)
 
         data = json.loads(raw)
-        return EvalResult(
+        eval_result = EvalResult(
             scope_adherence=int(data["scope_adherence"]),
             scope_reason=str(data["scope_reason"]),
             task_completion=int(data["task_completion"]),
@@ -326,7 +447,31 @@ async def eval_session(
             tool_use_quality=int(data["tool_use_quality"]),
             tool_use_reason=str(data["tool_use_reason"]),
             verdict=str(data["verdict"]),
+            run_id=resolved_run_id,
         )
+        # One joined line per eval: the scores, the turn(s) they were judged
+        # against, and the build that produced them. No prompt, no transcript.
+        eval_logger.info(
+            json.dumps(
+                {
+                    "event": "eval",
+                    "scope": "session",
+                    "run_id": resolved_run_id,
+                    "run_ids": [turn.run_id for turn in turns],
+                    "thread_id": thread_id,
+                    "app_version": app_version(),
+                    "scores": {
+                        "scope_adherence": eval_result.scope_adherence,
+                        "task_completion": eval_result.task_completion,
+                        "tool_use_quality": eval_result.tool_use_quality,
+                    },
+                    "verdict": eval_result.verdict,
+                    "metrics": _metrics_summary(turns) if turns else None,
+                },
+                separators=(",", ":"),
+            )
+        )
+        return eval_result
     except Exception as exc:  # noqa: BLE001
         logger.warning("Could not evaluate session %s: %s", thread_id, exc)
         return None

@@ -60,6 +60,29 @@ def build_model(config: Config) -> BaseChatModel:
     return init_chat_model(config.model, **kwargs)
 
 
+def build_eval_model(config: Config) -> BaseChatModel | None:
+    """Build the judge model, or None to reuse the main model.
+
+    Harness ``base_url``/``api_key`` are inherited only when the judge names the
+    configured provider; a foreign provider uses its own env-var credentials.
+    """
+    spec = (config.eval.model or "").strip()
+    if not spec:
+        return None
+    provider, sep, model_id = spec.partition(":")
+    if sep:
+        provider, model_id = provider.strip(), model_id.strip()
+    else:
+        provider, model_id = config.provider, spec
+    kwargs: dict[str, Any] = {"model_provider": provider}
+    if provider == config.provider:
+        if config.base_url is not None:
+            kwargs["base_url"] = config.base_url
+        if config.api_key is not None:
+            kwargs["api_key"] = config.api_key
+    return init_chat_model(model_id, **kwargs)
+
+
 def _resolve_subagent_model(value: str, provider: str, path: Path) -> str | None:
     """Translate a model value from frontmatter into a provider-prefixed spec.
 

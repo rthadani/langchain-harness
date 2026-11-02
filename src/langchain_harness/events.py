@@ -9,14 +9,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from pathlib import Path
 from typing import Any, AsyncIterator
 from uuid import uuid4
 
 from langchain_core.messages import HumanMessage
 
-from langchain_harness import __version__
 from langchain_harness import prompts as _prompts
-from langchain_harness.tracing import TurnMetricsHandler
+from langchain_harness.tracing import TurnMetricsHandler, app_version, record_metrics
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +32,7 @@ async def stream_turn_events(
     tags: list[str] | None = None,
     metadata: dict[str, Any] | None = None,
     cancel_outcome: str = "cancelled",
+    metrics_path: Path | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
     """Stream normalized events from a single agent turn.
 
@@ -45,6 +46,9 @@ async def stream_turn_events(
     JSON line per turn on the ``langchain_harness.metrics`` logger. ``run_id`` is
     the root trace id for the turn; callers forward it so feedback can be joined
     to the turn later.
+
+    When *metrics_path* is set, the turn is also appended to that JSONL sink, so
+    a later process (``harness eval``) can read the metrics of this turn.
     """
     run_id = uuid4()
     handler = TurnMetricsHandler(run_id, thread_id, user_id)
@@ -58,7 +62,7 @@ async def stream_turn_events(
             **(metadata or {}),
             "thread_id": thread_id,
             "user_id": user_id,
-            "app_version": __version__,
+            "app_version": app_version(),
         },
     }
     messages = {"messages": [HumanMessage(content=prompt)]}
@@ -119,7 +123,7 @@ async def stream_turn_events(
         # finish() is the only call that runs outside the callback manager's
         # exception guard, so a metrics failure must not mask the real error.
         try:
-            handler.finish(outcome)
+            record_metrics(handler.finish(outcome), metrics_path)
         except Exception:  # noqa: BLE001
             logger.warning("Failed to record turn metrics", exc_info=True)
 

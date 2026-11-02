@@ -168,6 +168,34 @@ The `done` event (and its SSE frame) now carries `run_id` — the root trace id 
 
 Each line carries `user_id`; hash or drop it before shipping metrics to a shared store. Token counts read 0 when an OpenAI-compatible endpoint omits usage while streaming.
 
+### Durable sink
+
+When the CLI runs a turn, the same JSON line is also appended to `<workspace>/.harness/metrics/turns.jsonl`. `harness eval <session>` runs in a fresh process that never streams a turn, so it reads the tail of that file (last 200 lines, filtered to the session) rather than the in-memory registry. The registry is bounded to the last 50 turns of the last 200 threads, and metrics failures are logged, never raised: a broken metrics path cannot break a turn.
+
+### Eval inputs and the joined record
+
+`/eval` and `harness eval <session>` now receive the last 10 turn metrics of the session as evidence for `tool_use_quality` — tool names and call counts, `tool_errors`, `model_calls`, `ttft_ms`, `total_ms`, `overhead_tokens`. The block is character-capped, so a long session cannot crowd out the transcript. Unfinished turns are skipped, and a session with no metrics gets the same prompt as before.
+
+Each successful eval logs exactly one joined JSON line on the `langchain_harness.eval` logger. It carries no prompt or conversation text:
+
+```json
+{"event":"eval","scope":"session","run_id":"5f1c...","run_ids":["5f1c..."],"thread_id":"a3b9...","app_version":"build-42","scores":{"scope_adherence":8,"task_completion":9,"tool_use_quality":7},"verdict":"...","metrics":{"turn_count":1,"totals":{...},"turns":[...]}}
+```
+
+`scope` is `session` because the scores judge a session, not one turn: `run_id` is the last turn's run id (the join key back to the metrics line) and `run_ids` lists every turn the judge saw. `HARNESS_APP_VERSION` overrides the package version in both the metrics metadata and the eval record, so set it per build — otherwise records from different builds are indistinguishable.
+
+### Choosing the judge
+
+The judge defaults to the main model, which means a session graded by the model that produced it. To grade with a different model:
+
+```toml
+# harness.toml
+[eval]
+model = "openai:gpt-4o-mini"
+```
+
+or `HARNESS_EVAL_MODEL=anthropic:claude-opus-4-5` (the env var wins over `harness.toml`). A bare id such as `gpt-4o-mini` uses the configured provider. Harness `base_url`/`api_key` are inherited only when the judge names the configured provider; a foreign provider uses its own env-var credentials. Unset means today's behavior: the main model judges.
+
 ## Server mode (multi-user web API)
 
 The harness can run as a multi-user web API server with per-user workspace isolation and pluggable auth.

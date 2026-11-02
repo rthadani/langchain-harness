@@ -31,6 +31,18 @@ class PromptsConfig:
 
 
 @dataclass(frozen=True)
+class EvalConfig:
+    """Optional override for the model that judges a session.
+
+    ``None`` reuses the main model, which keeps self-grading bias but changes
+    no behavior. ``model`` is ``model`` or ``provider:model``; a bare id uses
+    the configured provider.
+    """
+
+    model: str | None = None
+
+
+@dataclass(frozen=True)
 class CompactionConfig:
     """User-configurable conversation compaction thresholds.
 
@@ -96,6 +108,7 @@ class Config:
     compaction: CompactionConfig = field(default_factory=CompactionConfig)
     server: ServerConfig = field(default_factory=ServerConfig)
     prompts: PromptsConfig = field(default_factory=PromptsConfig)
+    eval: EvalConfig = field(default_factory=EvalConfig)
 
 
 def _load_toml(path: Path) -> dict[str, Any]:
@@ -150,6 +163,32 @@ def _resolve_prompts(toml_data: dict[str, Any], root: Path) -> PromptsConfig:
         compact=_resolve_prompt_value(section.get("compact"), root),
         compact_nudge=_resolve_prompt_value(section.get("compact_nudge"), root),
     )
+
+
+def _resolve_eval(toml_data: dict[str, Any]) -> EvalConfig:
+    """Build an ``EvalConfig`` from [eval] TOML and ``HARNESS_EVAL_MODEL``.
+
+    Raises ``SystemExit`` when the spec has an empty provider or model half:
+    silently falling back would grade sessions with the wrong judge.
+    """
+    section = toml_data.get("eval", {})
+    if not isinstance(section, dict):
+        section = {}
+
+    raw = os.environ.get("HARNESS_EVAL_MODEL") or section.get("model")
+    spec = raw.strip() if isinstance(raw, str) else ""
+    if not spec:
+        return EvalConfig()
+
+    provider, sep, model_id = spec.partition(":")
+    if sep and (not provider.strip() or not model_id.strip()):
+        print(
+            "Error: [eval] model must be 'model' or 'provider:model'.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
+    return EvalConfig(model=spec)
 
 
 def _resolve_compaction(toml_data: dict[str, Any]) -> CompactionConfig:
@@ -415,6 +454,7 @@ def resolve_config(
     compaction = _resolve_compaction(toml)
     server = _resolve_server(toml)
     prompts = _resolve_prompts(toml, cwd)
+    eval_config = _resolve_eval(toml)
 
     return Config(
         provider=resolved_provider,
@@ -424,4 +464,5 @@ def resolve_config(
         compaction=compaction,
         server=server,
         prompts=prompts,
+        eval=eval_config,
     )

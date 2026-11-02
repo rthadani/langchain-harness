@@ -38,9 +38,12 @@ async def _stream_turn(
     console: Console,
     *,
     tool_end_callback: Callable[[dict[str, Any]], None] | None = None,
+    metrics_path: Path | None = None,
 ) -> None:
     """Stream a single turn from *agent* to the console."""
-    async for event in stream_turn_events(agent, prompt, thread_id):
+    async for event in stream_turn_events(
+        agent, prompt, thread_id, metrics_path=metrics_path
+    ):
         etype = event["type"]
         if etype == "token":
             console.print(Text(event["text"]), end="")
@@ -73,6 +76,7 @@ async def run_once(
     model: Any | None = None,
     memory_root: Path | None = None,
     prompts: PromptsConfig | None = None,
+    metrics_path: Path | None = None,
 ) -> None:
     """Run a single user prompt and stream the result.
 
@@ -84,7 +88,9 @@ async def run_once(
         console = Console()
     try:
         try:
-            await _stream_turn(agent, prompt, thread_id, console)
+            await _stream_turn(
+                agent, prompt, thread_id, console, metrics_path=metrics_path
+            )
         except (KeyboardInterrupt, asyncio.CancelledError):
             console.print("\n[dim]Turn interrupted.[/dim]")
         except Exception as exc:  # noqa: BLE001
@@ -191,6 +197,8 @@ def _print_eval_result(console: Console, result: EvalResult) -> None:
         f"{'Tool use quality':<{label_w}} {result.tool_use_quality:>2}/10  {escape(result.tool_use_reason)}"
     )
     console.print(f"\nVerdict: {escape(result.verdict)}")
+    if result.run_id:
+        console.print(f"Run id: {escape(result.run_id)}")
 
 
 async def _eval_command(
@@ -200,8 +208,12 @@ async def _eval_command(
     model: Any | None,
     memory_root: Path | None,
     prompts: PromptsConfig | None = None,
+    *,
+    judge_model: Any | None = None,
+    metrics_path: Path | None = None,
 ) -> None:
-    if model is None:
+    judge = judge_model or model
+    if judge is None:
         console.print("[red]Error:[/red] eval is not available (no model configured)")
         return
     memory_texts: list[str] = []
@@ -212,9 +224,10 @@ async def _eval_command(
             except OSError:
                 pass
     result = await eval_session(
-        model, agent, thread_id,
+        judge, agent, thread_id,
         memory_texts=memory_texts,
         system_prompt=prompts.eval if prompts else None,
+        metrics_path=metrics_path,
     )
     if result is None:
         console.print("Nothing to evaluate.")
@@ -257,6 +270,8 @@ async def repl(
     model: Any | None = None,
     memory_root: Path | None = None,
     prompts: PromptsConfig | None = None,
+    judge_model: Any | None = None,
+    metrics_path: Path | None = None,
 ) -> None:
     """Run an interactive multi-turn REPL."""
     if console is None:
@@ -310,14 +325,25 @@ async def repl(
             )
             continue
         if lower == "/eval":
-            await _eval_command(agent, thread_id, console, model, memory_root, prompts=prompts)
+            await _eval_command(
+                agent,
+                thread_id,
+                console,
+                model,
+                memory_root,
+                prompts=prompts,
+                judge_model=judge_model,
+                metrics_path=metrics_path,
+            )
             continue
 
         if first_prompt is None:
             first_prompt = prompt
 
         try:
-            await _stream_turn(agent, prompt, thread_id, console)
+            await _stream_turn(
+                agent, prompt, thread_id, console, metrics_path=metrics_path
+            )
             await _upsert_session(db_conn, thread_id, title=prompt)
         except (KeyboardInterrupt, asyncio.CancelledError):
             console.print("\n[dim]Turn interrupted.[/dim]")

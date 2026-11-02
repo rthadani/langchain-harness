@@ -10,6 +10,8 @@ from langchain_harness import runner as runner_module
 from langchain_harness import memory as memory_module
 from langchain_harness.memory import inbox_dir, list_inbox
 from langchain_harness.runner import (
+    _eval_command,
+    _print_eval_result,
     _render_tool_call,
     _stream_turn,
     repl,
@@ -463,3 +465,79 @@ async def test_repl_does_not_summarize_on_exit(monkeypatch, tmp_path) -> None:
 
     assert model.calls == 0
     assert list_inbox(tmp_path) == []
+
+
+# --- eval command ---
+
+
+class _CapturingEvalSession:
+    """Records the judge and kwargs ``_eval_command`` passes to ``eval_session``."""
+
+    def __init__(self, result: Any = None) -> None:
+        self.result = result
+        self.calls: list[tuple[Any, ...]] = []
+        self.kwargs: list[dict[str, Any]] = []
+
+    async def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        self.calls.append(args)
+        self.kwargs.append(kwargs)
+        return self.result
+
+
+@pytest.mark.asyncio
+async def test_eval_command_prefers_judge_model(monkeypatch) -> None:
+    fake = _CapturingEvalSession()
+    monkeypatch.setattr(runner_module, "eval_session", fake)
+    main_model = object()
+    judge_model = object()
+
+    await _eval_command(
+        _MemoryAgent(), "thread-eval", Console(file=io.StringIO()), main_model, None,
+        judge_model=judge_model,
+    )
+
+    assert fake.calls[0][0] is judge_model
+    assert isinstance(fake.calls[0][1], _MemoryAgent)
+
+
+@pytest.mark.asyncio
+async def test_eval_command_falls_back_to_main_model(monkeypatch) -> None:
+    fake = _CapturingEvalSession()
+    monkeypatch.setattr(runner_module, "eval_session", fake)
+    main_model = object()
+
+    await _eval_command(
+        _MemoryAgent(), "thread-eval", Console(file=io.StringIO()), main_model, None
+    )
+
+    assert fake.calls[0][0] is main_model
+
+
+@pytest.mark.asyncio
+async def test_eval_command_reports_unavailable_without_models(monkeypatch) -> None:
+    fake = _CapturingEvalSession()
+    monkeypatch.setattr(runner_module, "eval_session", fake)
+    console = Console(file=io.StringIO())
+
+    await _eval_command(_MemoryAgent(), "thread-eval", console, None, None)
+
+    assert fake.calls == []
+    assert "eval is not available" in console.file.getvalue()
+
+
+def test_print_eval_result_includes_run_id() -> None:
+    console = Console(file=io.StringIO())
+    result = memory_module.EvalResult(
+        scope_adherence=8,
+        scope_reason="on topic",
+        task_completion=9,
+        task_reason="done",
+        tool_use_quality=7,
+        tool_use_reason="ok",
+        verdict="good",
+        run_id="run-abc-123",
+    )
+
+    _print_eval_result(console, result)
+
+    assert "Run id: run-abc-123" in console.file.getvalue()

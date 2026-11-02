@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import logging
 from typing import Any
 
 import pytest
@@ -9,6 +11,7 @@ import pytest
 from langchain_harness.frontmatter import parse_frontmatter
 from langchain_harness.memory import (
     _CONVERSATION_CHAR_LIMIT,
+    _METRICS_BLOCK_CHAR_LIMIT,
     _TRUNCATION_MARKER,
     EvalResult,
     active_memory_path,
@@ -21,6 +24,33 @@ from langchain_harness.memory import (
     summarize_session,
     write_inbox_note,
 )
+from langchain_harness.tracing import (
+    ToolStat,
+    TurnMetrics,
+    app_version,
+    clear_metrics,
+    record_metrics,
+)
+
+EVAL_LOGGER = "langchain_harness.eval"
+
+
+@pytest.fixture(autouse=True)
+def _empty_metrics_registry():
+    """Eval reads the shared registry; keep tests from seeing each other."""
+    clear_metrics()
+    yield
+    clear_metrics()
+
+
+def _turn(run_id: str, *, thread_id: str = "t1", **kwargs: Any) -> TurnMetrics:
+    fields: dict[str, Any] = {"total_ms": 3400.0, "ttft_ms": 480.0, "model_calls": 4}
+    fields.update(kwargs)
+    return TurnMetrics(run_id=run_id, thread_id=thread_id, **fields)
+
+
+def _eval_prompt(model: _FakeModel) -> str:
+    return model.calls[0][1].content
 
 
 class _FakeMsg:
@@ -370,6 +400,204 @@ async def test_eval_session_passes_thread_id_in_config() -> None:
     await eval_session(model, agent, "thread-xyz")
 
     assert agent.configs == [{"configurable": {"thread_id": "thread-xyz"}}]
+
+
+# --- eval_session with turn metrics ---
+
+
+@pytest.mark.asyncio
+async def test_eval_session_includes_metrics_block() -> None:
+    model = _FakeModel(_VALID_EVAL_JSON)
+    agent = _FakeAgent([_FakeMsg("human", "do it"), _FakeMsg("ai", "done")])
+    metrics = [
+        _turn(
+            "5dd0e629-aaaa",
+            tools=[
+                ToolStat("read_file", 1.0),
+                ToolStat("read_file", 2.0),
+                ToolStat("read_file", 3.0),
+                ToolStat("grep", 4.0, "tool_status_error"),
+            ],
+        )
+    ]
+
+    await eval_session(
+        model, agent, "t1", memory_texts=["scope: coding only"], metrics=metrics
+    )
+
+    prompt = _eval_prompt(model)
+    assert "Turn metrics (most recent last; showing last 1 of 1 recorded turns):" in prompt
+    assert (
+        "- run=5dd0e629 outcome=ok model_calls=4 tools=[read_file x3, grep x1 (1 err)] "
+        "tool_errors=1 ttft_ms=480 total_ms=3400 overhead_tokens=0"
+    ) in prompt
+    assert prompt.index("Project instructions:") < prompt.index("Turn metrics")
+    assert prompt.index("Turn metrics") < prompt.index("Conversation:")
+
+
+@pytest.mark.asyncio
+async def test_eval_session_omits_metrics_block_without_metrics() -> None:
+    model = _FakeModel(_VALID_EVAL_JSON)
+    agent = _FakeAgent([_FakeMsg("human", "do it"), _FakeMsg("ai", "done")])
+
+    result = await eval_session(model, agent, "t1")
+
+    assert result is not None
+    assert "Turn metrics" not in _eval_prompt(model)
+
+
+@pytest.mark.asyncio
+async def test_eval_session_reads_metrics_from_path(tmp_path) -> None:
+    model = _FakeModel(_VALID_EVAL_JSON)
+    agent = _FakeAgent([_FakeMsg("human", "do it"), _FakeMsg("ai", "done")])
+    path = tmp_path / "turns.jsonl"
+    record_metrics(_turn("run-path-1", tools=[ToolStat("grep", 1.0)]), path)
+    # A fresh process (``harness eval``) has no in-memory turns at all.
+    clear_metrics()
+
+    result = await eval_session(model, agent, "t1", metrics_path=path)
+
+    assert result is not None
+    assert "grep x1" in _eval_prompt(model)
+
+
+@pytest.mark.asyncio
+async def test_eval_session_uses_latest_metric_run_id() -> None:
+    model = _FakeModel(_VALID_EVAL_JSON)
+    agent = _FakeAgent([_FakeMsg("human", "do it"), _FakeMsg("ai", "done")])
+
+    result = await eval_session(
+        model, agent, "t1", metrics=[_turn("run-1"), _turn("run-2")]
+    )
+
+    assert result is not None
+    assert result.run_id == "run-2"
+
+
+@pytest.mark.asyncio
+async def test_eval_session_explicit_run_id_wins() -> None:
+    model = _FakeModel(_VALID_EVAL_JSON)
+    agent = _FakeAgent([_FakeMsg("human", "do it"), _FakeMsg("ai", "done")])
+
+    result = await eval_session(
+        model, agent, "t1", metrics=[_turn("run-1")], run_id="run-explicit"
+    )
+
+    assert result is not None
+    assert result.run_id == "run-explicit"
+
+
+@pytest.mark.asyncio
+async def test_eval_session_logs_joined_record(caplog) -> None:
+    caplog.set_level(logging.INFO, logger=EVAL_LOGGER)
+    model = _FakeModel(_VALID_EVAL_JSON)
+    agent = _FakeAgent([_FakeMsg("human", "do the secret thing"), _FakeMsg("ai", "done")])
+    metrics = [
+        _turn("run-1", tools=[ToolStat("read_file", 1.0)]),
+        _turn("run-2", tools=[ToolStat("read_file", 1.0), ToolStat("read_file", 2.0)]),
+    ]
+
+    await eval_session(
+        model, agent, "t1", memory_texts=["scope: coding only"], metrics=metrics
+    )
+
+    records = [r for r in caplog.records if r.name == EVAL_LOGGER]
+    assert len(records) == 1
+    message = records[0].getMessage()
+    payload = json.loads(message)
+    assert set(payload) == {
+        "event",
+        "scope",
+        "run_id",
+        "run_ids",
+        "thread_id",
+        "app_version",
+        "scores",
+        "verdict",
+        "metrics",
+    }
+    assert payload["event"] == "eval"
+    assert payload["scope"] == "session"
+    assert payload["run_id"] == "run-2"
+    assert payload["run_ids"] == ["run-1", "run-2"]
+    assert payload["thread_id"] == "t1"
+    assert payload["app_version"] == app_version()
+    assert payload["scores"] == {
+        "scope_adherence": 8,
+        "task_completion": 9,
+        "tool_use_quality": 7,
+    }
+    assert payload["verdict"] == "good session"
+    assert payload["metrics"]["turn_count"] == 2
+    assert payload["metrics"]["totals"]["tool_calls"] == 3
+    # Compact JSON, and no prompt or conversation text anywhere in the record.
+    assert '": ' not in message
+    assert "do the secret thing" not in message
+    assert "Project instructions" not in message
+
+
+@pytest.mark.asyncio
+async def test_joined_record_has_null_metrics_without_turns(caplog) -> None:
+    caplog.set_level(logging.INFO, logger=EVAL_LOGGER)
+    model = _FakeModel(_VALID_EVAL_JSON)
+    agent = _FakeAgent([_FakeMsg("human", "do it"), _FakeMsg("ai", "done")])
+
+    result = await eval_session(model, agent, "t1")
+
+    assert result is not None
+    payload = json.loads(
+        next(r for r in caplog.records if r.name == EVAL_LOGGER).getMessage()
+    )
+    assert payload["metrics"] is None
+    assert payload["run_id"] is None
+    assert payload["run_ids"] == []
+
+
+@pytest.mark.asyncio
+async def test_metrics_block_truncates_to_limit() -> None:
+    model = _FakeModel(_VALID_EVAL_JSON)
+    agent = _FakeAgent([_FakeMsg("human", "do it"), _FakeMsg("ai", "done")])
+    metrics = [
+        _turn(
+            f"run-{i:02d}-abcdef",
+            tools=[
+                ToolStat("read_file", 1.0),
+                ToolStat("read_file", 1.0),
+                ToolStat("read_file", 1.0, "tool_status_error"),
+                ToolStat("grep", 1.0),
+                ToolStat("write_file", 1.0),
+                ToolStat("bash", 1.0),
+            ],
+        )
+        for i in range(30)
+    ]
+
+    await eval_session(model, agent, "t1", metrics=metrics)
+
+    block = _eval_prompt(model).split("\n\nConversation:", 1)[0]
+    assert "of 30 recorded turns" in block
+    assert "showing last 10 of 30 recorded turns" in block
+    assert block.endswith(_TRUNCATION_MARKER)
+    assert len(block) == _METRICS_BLOCK_CHAR_LIMIT + len(_TRUNCATION_MARKER)
+
+
+@pytest.mark.asyncio
+async def test_metrics_block_skips_unfinished_turns() -> None:
+    model = _FakeModel(_VALID_EVAL_JSON)
+    agent = _FakeAgent([_FakeMsg("human", "do it"), _FakeMsg("ai", "done")])
+    metrics = [
+        _turn("run-aaaa1111"),
+        _turn("run-bbbb2222", total_ms=None),
+    ]
+
+    result = await eval_session(model, agent, "t1", metrics=metrics)
+
+    prompt = _eval_prompt(model)
+    assert "showing last 1 of 1 recorded turns" in prompt
+    assert "run-aaaa" in prompt
+    assert "run-bbbb" not in prompt
+    assert result is not None
+    assert result.run_id == "run-aaaa1111"
 
 
 # --- capture_session_note ---
