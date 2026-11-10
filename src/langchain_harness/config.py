@@ -95,6 +95,7 @@ class ServerConfig:
     enable_shell: bool = False
     auth_modes: tuple[str, ...] = ("trust",)
     jwt: JwtConfig = field(default_factory=JwtConfig)
+    admin_token: str | None = None
 
 
 @dataclass(frozen=True)
@@ -399,6 +400,11 @@ def _resolve_server(toml_data: dict[str, Any]) -> ServerConfig:
         enable_shell=enable_shell,
         auth_modes=auth_modes,
         jwt=jwt,
+        admin_token=(
+            os.environ.get("HARNESS_SERVER_ADMIN_TOKEN")
+            or (str(v) if (v := toml_section.get("admin_token")) else None)
+            or None
+        ),
     )
 
 

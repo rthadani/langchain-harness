@@ -124,6 +124,7 @@ def workspace_memory_sources(workspace: Path) -> list[str]:
         ("CLAUDE.md", "/CLAUDE.md"),
         ("AGENTS.md", "/AGENTS.md"),
         (".harness/memory/notes.md", "/.harness/memory/notes.md"),
+        (".harness/memory/user_memory.md", "/.harness/memory/user_memory.md"),
     )
     return [vpath for rel, vpath in candidates if (workspace / rel).is_file()]
 

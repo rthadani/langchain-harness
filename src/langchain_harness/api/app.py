@@ -16,6 +16,7 @@ from langchain_harness.config import Config
 from langchain_harness.discovery import discover_agents
 from langchain_harness.mcp_loader import load_mcp_connections
 from langchain_harness.api.auth import build_auth
+from langchain_harness.api.routes_admin import router as admin_router
 from langchain_harness.api.routes_published import router as published_router
 from langchain_harness.api.routes_sessions import router as sessions_router
 from langchain_harness.published import make_draft_tools, published_agent_files
@@ -104,6 +105,13 @@ class UserAgentCache:
             self._retired_stacks.append(stack)
             while len(self._retired_stacks) > _MAX_RETIRED_STACKS:
                 await self._retired_stacks.pop(0).aclose()
+
+    async def invalidate_all(self) -> list[str]:
+        """Invalidate every cached agent; returns the affected user ids."""
+        users = list(self._cache)
+        for uid in users:
+            await self.invalidate(uid)
+        return users
 
     async def _build_user_agent(self, user_id: str) -> Any:
         """Build a deep agent for a specific user with their own workspace."""
@@ -250,4 +258,5 @@ def create_app(cwd: Path, config: Config) -> FastAPI:
 
     app.include_router(sessions_router)
     app.include_router(published_router)
+    app.include_router(admin_router)
     return app

@@ -6,7 +6,9 @@ import asyncio
 import logging
 import os
 import sys
+from contextlib import AsyncExitStack
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 import typer
@@ -14,15 +16,17 @@ from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from rich.console import Console
 from rich.markup import escape
 
-from langchain_harness import memory
-from langchain_harness.agent_builder import build_agent, build_eval_model, build_model
+from langchain_harness import dream, memory
+from langchain_harness.agent_builder import _build_backend, build_agent, build_eval_model, build_model
 from langchain_harness.config import resolve_config
 from langchain_harness.discovery import discover_memory
 from langchain_harness.memory import eval_session
 from langchain_harness.runner import _print_eval_result, repl, run_once
+from langchain_harness.store import make_store
 from langchain_harness.tracing import default_metrics_path
 from langchain_harness import sessions
 from langchain_harness.sessions import connect, get_latest, resolve_prefix
+from langchain_harness.workspaces import provision_user_workspace
 
 app = typer.Typer(
     help="LangChain deepagents harness (Claude Code style).",
@@ -242,6 +246,118 @@ def memory_command(
 
 
 # ---------------------------------------------------------------------------
+# dream command
+# ---------------------------------------------------------------------------
+
+
+@app.command(name="dream")
+def dream_command(
+    capture: bool = typer.Option(
+        False,
+        "--capture",
+        help="Summarize each user's new sessions into their user_memory.md.",
+    ),
+    consolidate: bool = typer.Option(
+        False,
+        "--consolidate",
+        help="Build a reviewable draft of notes.md from new memory blocks.",
+    ),
+    user: str | None = typer.Option(
+        None,
+        "--user",
+        help="Limit capture to a single user id (capture only).",
+    ),
+    workspace: str | None = typer.Option(
+        None,
+        "--workspace",
+        help="Server working folder whose .harness/users tree to operate on",
+    ),
+) -> None:
+    """Capture per-user session memory or build a consolidation draft."""
+    _setup_logging()
+    if capture == consolidate:
+        print("Error: pass exactly one of --capture or --consolidate.", file=sys.stderr)
+        raise typer.Exit(1)
+
+    root = _resolve_root(workspace)
+    config = resolve_config(root)
+    model_obj = build_model(config)
+    console = Console()
+
+    if capture:
+
+        async def _capture() -> None:
+            store = make_store(root)
+            await store.initialize()
+            stack = AsyncExitStack()
+            agents: dict[str, Any] = {}
+
+            async def get_agent(uid: str) -> Any:
+                if uid in agents:
+                    return agents[uid]
+                workspace_dir = provision_user_workspace(root, uid)
+                backend = _build_backend(
+                    root, enable_shell=False, root_dir=workspace_dir
+                )
+                checkpointer = await stack.enter_async_context(store.checkpointer(uid))
+                agent = await build_agent(
+                    config,
+                    root,
+                    checkpointer=checkpointer,
+                    enable_shell=False,
+                    root_dir=workspace_dir,
+                    backend=backend,
+                    skills_override=[],
+                    memory_override=[],
+                    tools_override=[],
+                    agents_override=[],
+                    model=model_obj,
+                )
+                agents[uid] = agent
+                return agent
+
+            try:
+                result = await dream.capture_all(
+                    cwd=root, get_agent=get_agent, model=model_obj, user_id=user
+                )
+                for entry in result["users"]:
+                    uid = str(entry.get("user_id", "?"))
+                    if "error" in entry:
+                        console.print(
+                            f"{escape(uid)}: [red]error: {escape(entry['error'])}[/red]"
+                        )
+                    else:
+                        console.print(
+                            f"{escape(uid)}: {entry['captured']} captured, "
+                            f"{entry['skipped']} skipped"
+                        )
+            finally:
+                await stack.aclose()
+                await store.close()
+
+        asyncio.run(_capture())
+        return
+
+    async def _consolidate() -> None:
+        result = await dream.consolidate(cwd=root, model=model_obj)
+        status = result["status"]
+        if status == "draft":
+            console.print(
+                f"Draft created: {escape(result['draft_id'])} "
+                f"({result['items']} items)."
+            )
+            console.print(
+                "Approve via POST /v1/admin/memory/drafts/<id>/approve (admin API)."
+            )
+        elif status == "nothing-new":
+            console.print("Nothing new to consolidate.")
+        else:
+            console.print("Consolidation failed: the model returned no content.")
+
+    asyncio.run(_consolidate())
+
+
+# ---------------------------------------------------------------------------
 # eval command
 # ---------------------------------------------------------------------------
 
@@ -381,7 +497,7 @@ def db_init(
 # dispatch
 # ---------------------------------------------------------------------------
 
-_KNOWN_SUBCOMMANDS = {"run", "sessions", "serve", "memory", "eval", "db"}
+_KNOWN_SUBCOMMANDS = {"run", "sessions", "serve", "memory", "eval", "db", "dream"}
 
 # keep in sync with value-taking typer.Option declarations above
 _OPTIONS_WITH_VALUE = {
@@ -395,6 +511,7 @@ _OPTIONS_WITH_VALUE = {
     "--port",
     "-p",
     "--prompt",
+    "--user",
 }
 
 
